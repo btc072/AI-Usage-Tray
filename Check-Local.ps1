@@ -2,11 +2,17 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-$source = Join-Path $projectRoot 'src\AIUsageTray.cs'
+$sourceDir = Join-Path $projectRoot 'src'
 $notices = Join-Path $projectRoot 'THIRD-PARTY-NOTICES.txt'
 $distDir = [IO.Path]::GetFullPath((Join-Path $projectRoot 'dist'))
 
-foreach ($file in @($compiler, $source, $notices)) {
+$sources = @(Get-ChildItem -LiteralPath $sourceDir -Filter '*.cs' -File |
+    Sort-Object Name | ForEach-Object { $_.FullName })
+if ($sources.Count -eq 0) {
+    throw "No C# sources found in $sourceDir"
+}
+
+foreach ($file in @($compiler, $notices) + $sources) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
         throw "Required file not found: $file"
     }
@@ -25,7 +31,9 @@ $common = @(
 )
 
 & $compiler @common /target:winexe /main:AIUsageTray.Program `
-    "/out:$distDir\AIUsageTray.exe" $source
+    "/out:$distDir\AIUsageTray.exe" $sources
 if ($LASTEXITCODE -ne 0) { throw "Product build failed with exit code $LASTEXITCODE" }
 
 Write-Host 'PASS: local build'
+
+

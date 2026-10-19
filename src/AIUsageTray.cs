@@ -6,6 +6,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -66,6 +67,8 @@ namespace AIUsageTray
         internal List<ResetCredit> Credits { get; set; }
         internal DateTimeOffset ReceivedAtUtc { get; set; }
         internal SubscriptionMetadata Subscription { get; set; }
+        internal long? TodayTokens { get; set; }
+        internal double? TodayCost { get; set; }
     }
     internal static class UsageParser
     {
@@ -92,7 +95,7 @@ namespace AIUsageTray
             if (String.IsNullOrWhiteSpace(text)) return null;
             return text.Replace("\0", "").Replace("\r", "").Trim();
         }
-        private static double? Number(object value)
+        internal static double? Number(object value)
         {
             if (!(value is int || value is long || value is double || value is decimal || value is float)) return null;
             double number = Convert.ToDouble(value, CultureInfo.InvariantCulture);
@@ -109,6 +112,13 @@ namespace AIUsageTray
             if (!seconds.HasValue || seconds.Value != Math.Truncate(seconds.Value) ||
                 seconds.Value < -62135596800d || seconds.Value > 253402300799d) return null;
             return new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero).AddSeconds(seconds.Value);
+        }
+        internal static DateTimeOffset? OptionalUnixUtc(object value)
+        {
+            double? number = Number(value);
+            if (!number.HasValue) return OptionalDate(value);
+            double seconds = Math.Abs(number.Value) >= 100000000000d ? Math.Truncate(number.Value / 1000d) : number.Value;
+            return GetResetUtc(seconds);
         }
         internal static DateTimeOffset? OptionalDate(object value)
         {
@@ -375,7 +385,7 @@ namespace AIUsageTray
                     catch (ObjectDisposedException) { }
                     catch (InvalidOperationException) { }
                 });
-                Send(process, "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"ai-usage-tray\",\"version\":\"1.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}");
+                Send(process, "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"ai-usage-tray\",\"version\":\"2.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}");
                 Response(process, 1, deadline);
                 Send(process, "{\"method\":\"initialized\",\"params\":null}");
                 Send(process, "{\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":null}");
@@ -521,19 +531,39 @@ namespace AIUsageTray
         {
             return value.HasValue ? Math.Floor(value.Value).ToString(CultureInfo.InvariantCulture) + "%" : "—";
         }
+        internal static string FormatTokensCompact(long? tokens)
+        {
+            if (!tokens.HasValue) return "—";
+            double value = tokens.Value;
+            if (value < 1000d) return tokens.Value.ToString(CultureInfo.InvariantCulture);
+            if (value < 1000000d) return (value / 1000d).ToString("0.0", CultureInfo.InvariantCulture) + "K";
+            if (value < 1000000000d) return (value / 1000000d).ToString("0.0", CultureInfo.InvariantCulture) + "M";
+            return (value / 1000000000d).ToString("0.0", CultureInfo.InvariantCulture) + "B";
+        }
+        internal static string FormatTokensFull(long? tokens)
+        {
+            return tokens.HasValue ? tokens.Value.ToString("N0", CultureInfo.CurrentCulture) : "—";
+        }
+        internal static string FormatCost(double? cost)
+        {
+            return cost.HasValue ? "$" + cost.Value.ToString("0.00", CultureInfo.InvariantCulture) : "—";
+        }
         // Adapted glyph fitting / HICON ownership from VictorZakharov (embedded MIT notice).
         internal static Icon Create(double? five, double? weekly, int pixels)
         {
+            return Create(FormatPercent(five), FormatPercent(weekly), ColorFor(five, true), ColorFor(weekly, true), pixels);
+        }
+        internal static Icon Create(string top, string bottom, Color topColor, Color bottomColor, int pixels)
+        {
             const int scale = 8;
-            Color topColor = ColorFor(five, true), bottomColor = ColorFor(weekly, true);
             using (Bitmap large = new Bitmap(pixels * scale, pixels * scale, PixelFormat.Format32bppPArgb))
             using (Graphics g = Graphics.FromImage(large))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 float gap = large.Height / 8f;
                 float rowHeight = (large.Height - gap) / 2;
-                Draw(g, FormatPercent(five), topColor, new RectangleF(0, 0, large.Width, rowHeight));
-                Draw(g, FormatPercent(weekly), bottomColor, new RectangleF(0, rowHeight + gap, large.Width, rowHeight));
+                Draw(g, top, topColor, new RectangleF(0, 0, large.Width, rowHeight));
+                Draw(g, bottom, bottomColor, new RectangleF(0, rowHeight + gap, large.Width, rowHeight));
                 using (Bitmap small = new Bitmap(pixels, pixels, PixelFormat.Format32bppArgb))
                 using (Graphics output = Graphics.FromImage(small))
                 {
@@ -600,17 +630,20 @@ namespace AIUsageTray
         private Label fiveCountdown;
         private Label weekCountdown;
         private Label status;
+        private string provider;
         private UsageSnapshot snapshot;
         private string error;
+        private ProviderStatus providerStatus;
         private Rectangle anchor;
         private Rectangle layoutWork;
         private bool needsBuild = true;
         internal int CreditRows { get; private set; }
         internal bool ScrollNeeded { get { return body.AutoScrollMinSize.Height > body.ClientSize.Height; } }
-        internal PopupForm()
+        internal PopupForm(string providerName)
         {
+            provider = providerName;
             Text = "AI Usage Tray";
-            AccessibleName = UiText.T("Лимиты Codex", "Codex limits");
+            UpdateAccessibleName();
             FormBorderStyle = FormBorderStyle.None;
             AutoScaleMode = AutoScaleMode.None;
             DoubleBuffered = true;
@@ -638,12 +671,25 @@ namespace AIUsageTray
             base.OnHandleCreated(e);
             Native.ApplyPopupFrame(Handle);
         }
-        internal void SetSnapshot(UsageSnapshot value, string failure)
+        internal void SetSnapshot(UsageSnapshot value, string failure, ProviderStatus state)
         {
             snapshot = value;
             error = failure;
+            providerStatus = state;
             needsBuild = true;
             if (Visible) ShowCard(anchor, false);
+        }
+        internal void SetProvider(string providerName)
+        {
+            provider = providerName;
+            UpdateAccessibleName();
+            needsBuild = true;
+            if (Visible) ShowCard(anchor, false);
+        }
+        private void UpdateAccessibleName()
+        {
+            AccessibleName = provider == null ? UiText.T("Нет провайдера", "No provider") :
+                provider + UiText.T(" · данные провайдера", " · provider data");
         }
         internal void ShowCard(Rectangle anchor, bool activate)
         {
@@ -675,6 +721,8 @@ namespace AIUsageTray
             {
                 body.AutoScrollPosition = Point.Empty;
                 while (body.Controls.Count != 0) body.Controls[0].Dispose();
+                fiveCountdown = null;
+                weekCountdown = null;
                 if (normal != null) normal.Dispose();
                 if (bold != null) bold.Dispose();
                 dpi = newDpi;
@@ -688,26 +736,40 @@ namespace AIUsageTray
                 padding = 12 * dpi / 96;
                 string plan = snapshot == null ? null : snapshot.PlanType;
                 if (!String.IsNullOrEmpty(plan)) plan = plan.ToUpperInvariant();
-                AddTitle(plan == null ? UiText.T("Codex · тариф неизвестен", "Codex · plan unknown") : "Codex · " + plan, plan, 10);
-                Window(snapshot == null ? new UsageWindow() : snapshot.FiveHour, true);
-                Window(snapshot == null ? new UsageWindow() : snapshot.Weekly, false);
-                string count = snapshot != null && snapshot.AvailableResetCount.HasValue ?
-                    snapshot.AvailableResetCount.Value.ToString(CultureInfo.CurrentCulture) : UiText.T("нет данных", "not available");
-                Label resets = Add(UiText.T("Сбросов лимитов: ", "Limit resets: ") + count, 10);
-                CreditRows = 0;
-                if (snapshot != null)
+                string title = provider == null ? UiText.T("Нет провайдера", "No provider") :
+                    String.IsNullOrEmpty(plan) ? provider : provider + " · " + plan;
+                AddTitle(title, plan, 10);
+                if (provider == "OpenCode")
                 {
-                    foreach (ResetCredit credit in snapshot.Credits)
-                    {
-                        if (snapshot.AvailableResetCount.HasValue && CreditRows >= snapshot.AvailableResetCount.Value) break;
-                        CreditRows++;
-                        Add(UiText.T("До: ", "Until: ") + (credit.ExpiresUtc.HasValue ? LocalDate(credit.ExpiresUtc.Value) : UiText.T("нет данных", "not available")), 2);
-                    }
+                    string tokens = snapshot != null && snapshot.TodayTokens.HasValue ?
+                        TrayIconRenderer.FormatTokensFull(snapshot.TodayTokens) : UiText.T("нет данных", "not available");
+                    string cost = snapshot != null && snapshot.TodayCost.HasValue ?
+                        TrayIconRenderer.FormatCost(snapshot.TodayCost) : UiText.T("нет данных", "not available");
+                    Add(UiText.T("Токены за сегодня", "Tokens today") + " - " + tokens, 2, true);
+                    Add(UiText.T("Стоимость за сегодня (оценка)", "Cost today (estimated)") + " - " + cost, 10, true);
                 }
-                if (CreditRows > 0)
+                else if (provider != null)
                 {
-                    resets.Tag = 2;
-                    body.Controls[body.Controls.Count - 1].Tag = 10;
+                    Window(snapshot == null ? new UsageWindow() : snapshot.FiveHour, true);
+                    Window(snapshot == null ? new UsageWindow() : snapshot.Weekly, false);
+                    string count = snapshot != null && snapshot.AvailableResetCount.HasValue ?
+                        snapshot.AvailableResetCount.Value.ToString(CultureInfo.CurrentCulture) : UiText.T("нет данных", "not available");
+                    Label resets = Add(UiText.T("Сбросов лимитов: ", "Limit resets: ") + count, 10);
+                    CreditRows = 0;
+                    if (snapshot != null)
+                    {
+                        foreach (ResetCredit credit in snapshot.Credits)
+                        {
+                            if (snapshot.AvailableResetCount.HasValue && CreditRows >= snapshot.AvailableResetCount.Value) break;
+                            CreditRows++;
+                            Add(UiText.T("До: ", "Until: ") + (credit.ExpiresUtc.HasValue ? LocalDate(credit.ExpiresUtc.Value) : UiText.T("нет данных", "not available")), 2);
+                        }
+                    }
+                    if (CreditRows > 0)
+                    {
+                        resets.Tag = 2;
+                        body.Controls[body.Controls.Count - 1].Tag = 10;
+                    }
                 }
                 SubscriptionMetadata metadata = snapshot == null ? null : snapshot.Subscription;
                 if (metadata != null && metadata.ActiveUntilUtc.HasValue)
@@ -798,9 +860,7 @@ namespace AIUsageTray
                 changed |= SetText(fiveCountdown, UiText.T("До сброса: ", "Time to reset: ") + Countdown(snapshot.FiveHour.ResetUtc, now));
                 changed |= SetText(weekCountdown, UiText.T("До сброса: ", "Time to reset: ") + Countdown(snapshot.Weekly.ResetUtc, now));
             }
-            bool stale = IsStale(snapshot, error, now);
-            changed |= SetText(status, snapshot == null ? (error ?? UiText.T("Обновление…", "Updating…")) :
-                (stale ? UiText.T("Данные устарели.", "Data is out of date.") + (error == null ? "" : "\n" + error) : ""));
+            changed |= SetText(status, StatusText(provider, providerStatus, snapshot, error, now));
             if (changed && resize && Visible) FitToText(Screen.FromControl(this).WorkingArea);
         }
         private static bool SetText(Label label, string text)
@@ -808,6 +868,23 @@ namespace AIUsageTray
             if (label == null || label.Text == text) return false;
             label.Text = text; label.AccessibleName = text;
             return true;
+        }
+        internal static string StatusText(string provider, ProviderStatus state, UsageSnapshot data, string error, DateTimeOffset now)
+        {
+            if (provider == null) return UiText.T("Выберите провайдера в меню", "Choose a provider in the menu");
+            string stale = UiText.T("Данные устарели.", "Data is out of date.") + (error == null ? "" : "\n" + error);
+            if (state == ProviderStatus.Gone)
+                return data == null ? UiText.T("нет данных", "not available") :
+                    stale + "\n" + UiText.T("данные не поступают; провайдер неактивен", "no data is arriving; the provider is inactive");
+            if (data == null)
+                return error == null ? UiText.T("Обновление…", "Updating…") :
+                    error + "\n" + UiText.T("нет данных", "not available");
+            if (state == ProviderStatus.Stale || IsStale(data, error, now)) return stale;
+            if (state == ProviderStatus.Offline)
+                return provider == "OpenCode" ?
+                    UiText.T("OpenCode не запущен; данные из локальной базы", "OpenCode is not running; data from the local database") :
+                    provider + UiText.T(" не запущен; данные из сохранённого входа", " is not running; data from the saved sign-in");
+            return "";
         }
         internal static bool IsStale(UsageSnapshot data, string error, DateTimeOffset now)
         {
@@ -866,6 +943,7 @@ namespace AIUsageTray
         internal readonly int TaskbarCreated = Native.RegisterWindowMessage("TaskbarCreated");
         internal Action<int, Point> Callback { get; set; }
         internal Action SessionEnded { get; set; }
+        internal string Tip { get; set; }
         internal bool Registered { get; private set; }
         internal int RegistrationCount { get; private set; }
         private Icon icon;
@@ -881,7 +959,7 @@ namespace AIUsageTray
         {
             return new Native.IconData { Size = (uint)Marshal.SizeOf(typeof(Native.IconData)),
                 Window = Handle, Id = 1, Flags = 7, Callback = CallbackMessage,
-                Icon = icon == null ? IntPtr.Zero : icon.Handle, Tip = UiText.T("Codex · сверху 5 ч, снизу неделя", "Codex · top: 5 hours, bottom: week"),
+                Icon = icon == null ? IntPtr.Zero : icon.Handle, Tip = Tip ?? String.Empty,
                 Info = "", InfoTitle = ""
             };
         }
@@ -946,27 +1024,43 @@ namespace AIUsageTray
     }
     internal sealed class TrayContext : ApplicationContext
     {
-        private readonly CodexReader reader = new CodexReader();
-        private readonly CancellationTokenSource stop = new CancellationTokenSource();
+        private readonly IUsageProvider[] providers;
+        private IUsageProvider provider;
+        private CancellationTokenSource stop = new CancellationTokenSource();
         private readonly System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer { Interval = 1 };
         private readonly System.Windows.Forms.Timer hover = new System.Windows.Forms.Timer { Interval = 100 };
         private readonly System.Windows.Forms.Timer open = new System.Windows.Forms.Timer { Interval = 500 };
         private readonly ContextMenuStrip menu = new ContextMenuStrip();
         internal readonly TrayWindow Tray = new TrayWindow();
-        internal readonly PopupForm Popup = new PopupForm();
+        internal readonly PopupForm Popup;
         private Icon icon;
         private string signature;
         private UsageSnapshot snapshot;
         private string error;
-        private bool refreshing;
+        private int generation;
+        private Task cycle = Task.FromResult<object>(null);
         private bool exiting;
         private DateTime? outsideSince;
         private Rectangle hoverAnchor;
-        internal TrayContext(bool startPolling)
+        internal IUsageProvider[] Providers { get { return providers; } }
+        internal IUsageProvider CurrentProvider { get { return provider; } }
+        internal TrayContext(IUsageProvider[] registry, bool startPolling)
         {
+            providers = registry;
+            Popup = new PopupForm(null);
+            Tray.Tip = TipFor(null);
             Tray.Callback = OnTray;
             Tray.SessionEnded = ExitThread;
+            foreach (IUsageProvider candidate in providers)
+            {
+                IUsageProvider next = candidate;
+                ToolStripMenuItem item = new ToolStripMenuItem(next.Id, null, delegate { SwitchProvider(next); });
+                item.Tag = next;
+                menu.Items.Add(item);
+            }
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(UiText.T("Выход", "Exit"), null, delegate { ExitThread(); });
+            menu.Opening += delegate { RefreshProviderItems(); };
             menu.Closed += delegate { Tray.ReturnFocus(); };
             hover.Tick += delegate { CheckHover(DateTime.UtcNow); };
             open.Tick += delegate {
@@ -978,46 +1072,137 @@ namespace AIUsageTray
             if (Tray.Registered) DrawIcon(); // Recalculate against the registered icon's monitor.
             if (startPolling) poll.Start();
         }
-        private async Task Refresh()
+        internal void SwitchProvider(IUsageProvider next)
         {
-            if (refreshing || exiting) return;
-            refreshing = true;
+            if (next == null || next == provider) return;
+            generation++;
+            CancellationTokenSource previous = stop;
+            stop = new CancellationTokenSource();
+            previous.Cancel();
+            previous.Dispose();
+            provider = next;
+            snapshot = null;
+            error = null;
+            signature = null;
+            Popup.SetProvider(next.Id);
+            Tray.Tip = TipFor(next.Id);
+            DrawIcon();
+            Popup.SetSnapshot(snapshot, error, CurrentStatus());
+            Task prior = cycle;
+            cycle = prior.IsCompleted ? ReadOnce() : WaitThenRead(prior);
+        }
+        private static string TipFor(string providerId)
+        {
+            return providerId == null ? UiText.T("Выберите провайдера в меню", "Choose a provider in the menu") :
+                providerId + " · " + (providerId == "OpenCode" ?
+                    UiText.T("сверху токены за сегодня, снизу стоимость", "top: tokens today, bottom: cost") :
+                    UiText.T("сверху 5 ч, снизу неделя", "top: 5 hours, bottom: week"));
+        }
+        private Task Refresh()
+        {
+            if (exiting) return cycle;
+            if (provider == null)
+            {
+                IUsageProvider detected = DetectFirst();
+                if (detected != null) SwitchProvider(detected);
+                return cycle;
+            }
+            if (!cycle.IsCompleted) return cycle;
+            cycle = ReadOnce();
+            return cycle;
+        }
+        private IUsageProvider DetectFirst()
+        {
+            foreach (IUsageProvider candidate in providers)
+            {
+                try { if (candidate.Detect() != ProviderAvailability.None) return candidate; }
+                catch (Exception) { }
+            }
+            return null;
+        }
+        private async Task ReadOnce()
+        {
+            int current = generation;
+            IUsageProvider source = provider;
             try
             {
-                UsageSnapshot result = await reader.ReadAsync(stop.Token);
-                if (!exiting) { snapshot = result; error = null; }
+                UsageSnapshot result = await source.ReadAsync(stop.Token, 15000);
+                if (!exiting && current == generation) { snapshot = result; error = null; }
             }
             catch (OperationCanceledException) { }
-            catch (UsageReadException exception) { if (!exiting) error = exception.Message; }
-            catch (Exception) { if (!exiting) error = UiText.T("Не удалось прочитать данные Codex", "Unable to read Codex data"); }
+            catch (UsageReadException exception) { if (!exiting && current == generation) error = exception.Message; }
+            catch (Exception) { if (!exiting && current == generation) error = ReadFailureText(source.Id); }
             finally
             {
-                refreshing = false;
-                if (!exiting) { DrawIcon(); Popup.SetSnapshot(snapshot, error); }
+                if (!exiting && current == generation)
+                {
+                    DrawIcon();
+                    Popup.SetSnapshot(snapshot, error, CurrentStatus());
+                }
             }
+        }
+        private async Task WaitThenRead(Task prior)
+        {
+            try { await prior; }
+            catch (Exception) { }
+            if (!exiting && provider != null) await ReadOnce();
+        }
+        internal static string ReadFailureText(string providerId)
+        {
+            return UiText.T("Не удалось прочитать данные " + providerId, "Unable to read " + providerId + " data");
+        }
+        private ProviderStatus CurrentStatus()
+        {
+            IUsageProvider source = provider;
+            if (source == null) return ProviderStatus.NoData;
+            try { return source.Status; }
+            catch (Exception) { return ProviderStatus.NoData; }
         }
         internal void SetSnapshot(UsageSnapshot value, string failure)
         {
             snapshot = value;
             error = failure;
             DrawIcon();
-            Popup.SetSnapshot(snapshot, error);
+            Popup.SetSnapshot(snapshot, error, CurrentStatus());
         }
         private void DrawIcon()
         {
-            double? five = snapshot == null ? null : snapshot.FiveHour.Remaining;
-            double? week = snapshot == null ? null : snapshot.Weekly.Remaining;
             Rectangle rect = Tray.IconBounds();
             int dpi = Native.DpiAt(rect.Location);
             int pixels = Math.Max(16, 16 * dpi / 96);
-            string next = TrayIconRenderer.FormatPercent(five) + ":" + TrayIconRenderer.ColorFor(five).ToArgb() + "/" +
-                TrayIconRenderer.FormatPercent(week) + ":" + TrayIconRenderer.ColorFor(week).ToArgb() + "/" + pixels;
-            if (next == signature)
+            string next;
+            Icon replacement;
+            if (provider != null && provider.Id == "OpenCode")
             {
-                if (!Tray.Registered) Tray.Restore();
-                return;
+                long? tokens = snapshot == null ? null : snapshot.TodayTokens;
+                double? cost = snapshot == null ? null : snapshot.TodayCost;
+                Color neutral = Native.TrayDark ? Color.White : Color.FromArgb(32, 32, 32);
+                Color missing = TrayIconRenderer.ColorFor(null, true);
+                string top = TrayIconRenderer.FormatTokensCompact(tokens);
+                string bottom = TrayIconRenderer.FormatCost(cost);
+                Color topColor = tokens.HasValue ? neutral : missing;
+                Color bottomColor = cost.HasValue ? neutral : missing;
+                next = top + ":" + topColor.ToArgb() + "/" + bottom + ":" + bottomColor.ToArgb() + "/" + pixels;
+                if (next == signature)
+                {
+                    if (!Tray.Registered) Tray.Restore();
+                    return;
+                }
+                replacement = TrayIconRenderer.Create(top, bottom, topColor, bottomColor, pixels);
             }
-            Icon replacement = TrayIconRenderer.Create(five, week, pixels);
+            else
+            {
+                double? five = snapshot == null ? null : snapshot.FiveHour.Remaining;
+                double? week = snapshot == null ? null : snapshot.Weekly.Remaining;
+                next = TrayIconRenderer.FormatPercent(five) + ":" + TrayIconRenderer.ColorFor(five).ToArgb() + "/" +
+                    TrayIconRenderer.FormatPercent(week) + ":" + TrayIconRenderer.ColorFor(week).ToArgb() + "/" + pixels;
+                if (next == signature)
+                {
+                    if (!Tray.Registered) Tray.Restore();
+                    return;
+                }
+                replacement = TrayIconRenderer.Create(five, week, pixels);
+            }
             Tray.Update(replacement);
             if (icon != null) icon.Dispose();
             icon = replacement;
@@ -1040,6 +1225,20 @@ namespace AIUsageTray
                 Popup.ShowCard(Anchor(), true);
                 hover.Start();
                 menu.Show(point.X == -1 ? Cursor.Position : point);
+            }
+        }
+        private void RefreshProviderItems()
+        {
+            foreach (ToolStripItem entry in menu.Items)
+            {
+                ToolStripMenuItem item = entry as ToolStripMenuItem;
+                IUsageProvider candidate = entry.Tag as IUsageProvider;
+                if (item == null || candidate == null) continue;
+                bool detected = false;
+                try { detected = candidate.Detect() != ProviderAvailability.None; }
+                catch (Exception) { }
+                item.Enabled = detected;
+                item.Checked = candidate == provider;
             }
         }
         internal void CheckHover(DateTime now)
@@ -1065,7 +1264,7 @@ namespace AIUsageTray
             exiting = true;
             poll.Stop(); hover.Stop(); open.Stop();
             stop.Cancel();
-            reader.Dispose();
+            foreach (IUsageProvider candidate in providers) candidate.Dispose();
             Tray.Dispose();
             Popup.Dispose();
             menu.Dispose();
@@ -1074,34 +1273,814 @@ namespace AIUsageTray
             base.ExitThreadCore();
         }
     }
+    internal enum ProviderAvailability { None, Offline, Active }
+    internal enum ProviderStatus { Active, Offline, NoData, Stale, Gone }
+    internal interface IUsageProvider : IDisposable
+    {
+        string Id { get; }
+        int Priority { get; }
+        ProviderAvailability Detect();
+        ProviderStatus Status { get; }
+        Task<UsageSnapshot> ReadAsync(CancellationToken stop, int timeoutMilliseconds);
+    }
+    internal sealed class CodexProvider : IUsageProvider
+    {
+        private readonly CodexReader reader = new CodexReader();
+        private UsageSnapshot snapshot;
+        private string error;
+        public string Id { get { return "Codex"; } }
+        public int Priority { get { return 1; } }
+        public ProviderStatus Status
+        {
+            get { return ClassifyStatus(Detect(), snapshot, error, DateTimeOffset.UtcNow); }
+        }
+        public ProviderAvailability Detect()
+        {
+            return Classify(UserProcessRunning(), SavedLoginPresent());
+        }
+        public async Task<UsageSnapshot> ReadAsync(CancellationToken stop, int timeoutMilliseconds)
+        {
+            try
+            {
+                UsageSnapshot result = await reader.ReadAsync(null, stop, timeoutMilliseconds);
+                snapshot = result;
+                error = null;
+                return result;
+            }
+            catch (UsageReadException exception)
+            {
+                error = exception.Message;
+                throw;
+            }
+        }
+        internal static ProviderAvailability Classify(bool processRunning, bool savedLogin)
+        {
+            if (processRunning) return ProviderAvailability.Active;
+            if (savedLogin) return ProviderAvailability.Offline;
+            return ProviderAvailability.None;
+        }
+        internal static ProviderStatus ClassifyStatus(ProviderAvailability availability, UsageSnapshot data, string failure, DateTimeOffset now)
+        {
+            if (availability == ProviderAvailability.None) return ProviderStatus.Gone;
+            if (PopupForm.IsStale(data, failure, now)) return ProviderStatus.Stale;
+            if (data == null) return ProviderStatus.NoData;
+            return availability == ProviderAvailability.Active ? ProviderStatus.Active : ProviderStatus.Offline;
+        }
+        private bool UserProcessRunning()
+        {
+            int owned = reader.OwnedProcessId;
+            bool found = false;
+            try
+            {
+                foreach (Process process in Process.GetProcessesByName("codex"))
+                {
+                    try { found = found || process.Id != owned; }
+                    catch (InvalidOperationException) { }
+                    finally { process.Dispose(); }
+                }
+            }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            return found;
+        }
+        private static bool SavedLoginPresent()
+        {
+            try
+            {
+                string home = Environment.GetEnvironmentVariable("CODEX_HOME");
+                if (String.IsNullOrEmpty(home)) home = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+                return File.Exists(Path.Combine(home, "auth.json"));
+            }
+            catch (ArgumentException) { return false; }
+            catch (System.Security.SecurityException) { return false; }
+        }
+        public void Dispose() { reader.Dispose(); }
+    }
+    internal sealed class ClaudeCredentials
+    {
+        internal string AccessToken { get; set; }
+        internal DateTimeOffset? ExpiresUtc { get; set; }
+        internal string SubscriptionType { get; set; }
+    }
+    internal static class ClaudeFiles
+    {
+        internal static string DesktopConfigOverride = null;
+        internal static string ConfigDirectory()
+        {
+            string configured = null;
+            try { configured = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR"); }
+            catch (System.Security.SecurityException) { }
+            if (!String.IsNullOrEmpty(configured)) return configured.Trim();
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
+        }
+        internal static string CredentialsPath()
+        {
+            return Path.Combine(ConfigDirectory(), ".credentials.json");
+        }
+        internal static string DesktopConfigPath()
+        {
+            if (!String.IsNullOrEmpty(DesktopConfigOverride)) return DesktopConfigOverride;
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", "config.json");
+        }
+        internal static bool CredentialsPresent()
+        {
+            return Exists(CredentialsPath());
+        }
+        internal static bool DesktopConfigPresent()
+        {
+            return Exists(DesktopConfigPath());
+        }
+        internal static bool DirectoryPresent()
+        {
+            try { return Directory.Exists(ConfigDirectory()) || Directory.Exists(Path.GetDirectoryName(DesktopConfigPath())); }
+            catch (ArgumentException) { return false; }
+            catch (NotSupportedException) { return false; }
+        }
+        private static bool Exists(string path)
+        {
+            try { return File.Exists(path); }
+            catch (ArgumentException) { return false; }
+            catch (NotSupportedException) { return false; }
+        }
+    }
+    internal static class ClaudeCredentialsReader
+    {
+        internal static ClaudeCredentials ReadSaved()
+        {
+            ClaudeCredentials code = ReadClaudeCode();
+            if (code != null) return code;
+            return ReadClaudeDesktop();
+        }
+        private static ClaudeCredentials ReadClaudeCode()
+        {
+            try
+            {
+                FileInfo file = new FileInfo(ClaudeFiles.CredentialsPath());
+                if (!file.Exists || file.Length > 1024 * 1024) return null;
+                Dictionary<string, object> data = UsageParser.Json(File.ReadAllText(file.FullName, Encoding.UTF8));
+                return FromMap(UsageParser.Map(UsageParser.Field(data, "claudeAiOauth")) ?? data);
+            }
+            catch (IOException) { return null; }
+            catch (UnauthorizedAccessException) { return null; }
+            catch (ArgumentException) { return null; }
+            catch (UsageReadException) { return null; }
+        }
+        private static ClaudeCredentials ReadClaudeDesktop()
+        {
+            try
+            {
+                FileInfo file = new FileInfo(ClaudeFiles.DesktopConfigPath());
+                if (!file.Exists || file.Length > 8 * 1024 * 1024) return null;
+                Dictionary<string, object> config = UsageParser.Json(File.ReadAllText(file.FullName, Encoding.UTF8));
+                ClaudeCredentials cached = FromDesktopValue(UsageParser.Text(UsageParser.Field(config, "oauth:tokenCacheV2")));
+                if (cached != null) return cached;
+                return FromDesktopValue(UsageParser.Text(UsageParser.Field(config, "oauth:tokenCache")));
+            }
+            catch (IOException) { return null; }
+            catch (UnauthorizedAccessException) { return null; }
+            catch (ArgumentException) { return null; }
+            catch (UsageReadException) { return null; }
+        }
+        internal static ClaudeCredentials FromDesktopValue(string raw)
+        {
+            if (String.IsNullOrEmpty(raw) || raw.Length > 256 * 1024) return null;
+            string trimmed = raw.Trim();
+            if (!trimmed.StartsWith("{", StringComparison.Ordinal) && !trimmed.StartsWith("[", StringComparison.Ordinal))
+                return trimmed.StartsWith("sk-ant-", StringComparison.Ordinal) ? Direct(trimmed) : null;
+            try
+            {
+                object parsed = new JavaScriptSerializer { MaxJsonLength = UsageParser.MaxJsonLength, RecursionLimit = 64 }.DeserializeObject(raw);
+                return FindTokened(parsed, 0, new int[] { 4096 });
+            }
+            catch (ArgumentException) { return null; }
+            catch (InvalidOperationException) { return null; }
+        }
+        private static ClaudeCredentials FindTokened(object node, int depth, int[] budget)
+        {
+            if (node == null || depth > 8 || --budget[0] < 0) return null;
+            Dictionary<string, object> map = node as Dictionary<string, object>;
+            if (map != null)
+            {
+                ClaudeCredentials direct = FromMap(map);
+                if (direct != null) return direct;
+                foreach (KeyValuePair<string, object> item in map)
+                {
+                    ClaudeCredentials nested = FindTokened(item.Value, depth + 1, budget);
+                    if (nested != null) return nested;
+                }
+                return null;
+            }
+            object[] list = node as object[];
+            if (list == null) return null;
+            foreach (object item in list)
+            {
+                ClaudeCredentials nested = FindTokened(item, depth + 1, budget);
+                if (nested != null) return nested;
+            }
+            return null;
+        }
+        private static ClaudeCredentials FromMap(Dictionary<string, object> map)
+        {
+            if (map == null) return null;
+            string token = Token(UsageParser.Text(UsageParser.Field(map, "accessToken")) ??
+                UsageParser.Text(UsageParser.Field(map, "access_token")));
+            if (token == null) return null;
+            return new ClaudeCredentials {
+                AccessToken = token,
+                ExpiresUtc = UsageParser.OptionalUnixUtc(UsageParser.Field(map, "expiresAt") ?? UsageParser.Field(map, "expires_at")),
+                SubscriptionType = UsageParser.Text(UsageParser.Field(map, "subscriptionType")) ??
+                    UsageParser.Text(UsageParser.Field(map, "subscription_type"))
+            };
+        }
+        private static ClaudeCredentials Direct(string token)
+        {
+            string clean = Token(token);
+            return clean == null ? null : new ClaudeCredentials { AccessToken = clean };
+        }
+        private static string Token(string value)
+        {
+            if (String.IsNullOrEmpty(value)) return null;
+            string token = value.Trim();
+            if (token.Length == 0 || token.Length > 4096) return null;
+            foreach (char character in token)
+                if (character < 0x21 || character > 0x7e) return null;
+            return token;
+        }
+    }
+    internal static class ClaudeUsageParser
+    {
+        internal static UsageSnapshot Parse(string json, ClaudeCredentials credentials, DateTimeOffset now)
+        {
+            Dictionary<string, object> envelope;
+            try { envelope = UsageParser.Json(json); }
+            catch (UsageReadException) { throw new UsageReadException(UiText.T("Некорректный ответ Claude", "Invalid response from Claude")); }
+            string plan = UsageParser.Text(UsageParser.Field(envelope, "planType")) ??
+                (credentials == null ? null : credentials.SubscriptionType);
+            UsageSnapshot snapshot = new UsageSnapshot {
+                FiveHour = Window(envelope, "five_hour"), Weekly = Window(envelope, "seven_day"),
+                PlanType = plan,
+                Credits = new List<ResetCredit>(), ReceivedAtUtc = now
+            };
+            if (snapshot.FiveHour.Remaining == null && snapshot.FiveHour.ResetUtc == null &&
+                snapshot.Weekly.Remaining == null && snapshot.Weekly.ResetUtc == null)
+                throw new UsageReadException(UiText.T("Сервис Claude вернул неизвестный формат", "Unexpected response format from Claude"));
+            return snapshot;
+        }
+        internal static UsageWindow Window(Dictionary<string, object> envelope, string key)
+        {
+            Dictionary<string, object> window = UsageParser.Map(UsageParser.Field(envelope, key));
+            UsageWindow result = new UsageWindow {
+                Remaining = GetRemaining(UsageParser.Field(window, "utilization")),
+                ResetUtc = UsageParser.OptionalDate(UsageParser.Field(window, "resets_at"))
+            };
+            if (!result.Remaining.HasValue)
+                result.Remaining = GetRemainingPercent(UsageParser.Field(window, "used_percent") ?? UsageParser.Field(window, "usedPercent"));
+            return result;
+        }
+        internal static double? GetRemaining(object utilization)
+        {
+            double? used = UsageParser.Number(utilization);
+            if (!used.HasValue) return null;
+            double percent = used.Value <= 1d ? used.Value * 100d : used.Value;
+            return RemainingFromPercent(percent);
+        }
+        internal static double? GetRemainingPercent(object percentValue)
+        {
+            double? percent = UsageParser.Number(percentValue);
+            return percent.HasValue ? RemainingFromPercent(percent.Value) : null;
+        }
+        private static double? RemainingFromPercent(double percent)
+        {
+            if (percent < 0d || percent > 100d) return null;
+            return Math.Max(0d, Math.Min(100d, 100d - percent));
+        }
+    }
+    internal sealed class ClaudeReader : IDisposable
+    {
+        internal const string UsageUrl = "https://api.anthropic.com/api/oauth/usage";
+        internal const string UserAgent = "AIUsageTray/2.0.0";
+        internal const int ResponseLimit = 1024 * 1024;
+        internal const int TooManyRequestsBackoffMinutes = 5;
+        private static readonly DateTime NoBackoff = DateTime.MinValue;
+        private readonly object requestLock = new object();
+        private HttpWebRequest active;
+        private DateTime backoffUntilUtc = NoBackoff;
+        private bool disposed;
+        private int reading;
+        static ClaudeReader()
+        {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+        }
+        internal async Task<UsageSnapshot> ReadAsync(CancellationToken stop, int timeoutMilliseconds)
+        {
+            if (Interlocked.CompareExchange(ref reading, 1, 0) != 0)
+                throw new UsageReadException(UiText.T("Чтение Claude уже выполняется", "A Claude read is already in progress"));
+            try
+            {
+                using (CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(stop))
+                {
+                    deadline.CancelAfter(timeoutMilliseconds);
+                    return await Task.Run(delegate { return Read(deadline.Token, stop); }).ConfigureAwait(false);
+                }
+            }
+            finally { Interlocked.Exchange(ref reading, 0); }
+        }
+        private UsageSnapshot Read(CancellationToken deadline, CancellationToken stop)
+        {
+            if (DateTime.UtcNow < backoffUntilUtc)
+                throw new UsageReadException(CategoryFor(429));
+            ClaudeCredentials credentials = ClaudeCredentialsReader.ReadSaved();
+            if (credentials == null || String.IsNullOrEmpty(credentials.AccessToken))
+                throw new UsageReadException(UiText.T("Сохранённый вход Claude не найден", "No saved Claude sign-in found"));
+            if (credentials.ExpiresUtc.HasValue && credentials.ExpiresUtc.Value <= DateTimeOffset.UtcNow)
+                throw new UsageReadException(UiText.T("Срок сохранённого входа Claude истёк", "The saved Claude sign-in has expired"));
+            deadline.ThrowIfCancellationRequested();
+            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(UsageUrl);
+            request.Method = "GET";
+            request.Timeout = 15000;
+            request.ReadWriteTimeout = 15000;
+            request.Accept = "application/json";
+            request.UserAgent = UserAgent;
+            request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+            request.Headers["Authorization"] = "Bearer " + credentials.AccessToken;
+            request.Headers["anthropic-beta"] = "oauth-2025-04-20";
+            CancellationTokenRegistration cancel = new CancellationTokenRegistration();
+            try
+            {
+                lock (requestLock)
+                {
+                    if (disposed) throw new OperationCanceledException(stop);
+                    active = request;
+                }
+                cancel = deadline.Register(AbortActive);
+                deadline.ThrowIfCancellationRequested();
+                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                using (Stream stream = response.GetResponseStream())
+                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+                {
+                    StringBuilder body = new StringBuilder();
+                    char[] buffer = new char[8192];
+                    int count;
+                    while ((count = reader.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        if (body.Length + count > ResponseLimit)
+                            throw new UsageReadException(UiText.T("Ответ Claude слишком большой", "Claude response is too large"));
+                        body.Append(buffer, 0, count);
+                    }
+                    deadline.ThrowIfCancellationRequested();
+                    return ClaudeUsageParser.Parse(body.ToString(), credentials, DateTimeOffset.UtcNow);
+                }
+            }
+            catch (WebException exception)
+            {
+                if (stop.IsCancellationRequested) throw new OperationCanceledException(stop);
+                HttpWebResponse response = exception.Response as HttpWebResponse;
+                if (response != null)
+                {
+                    int status = (int)response.StatusCode;
+                    response.Close();
+                    if (status == 429) backoffUntilUtc = DateTime.UtcNow.AddMinutes(TooManyRequestsBackoffMinutes);
+                    throw new UsageReadException(CategoryFor(status));
+                }
+                if (exception.Status == WebExceptionStatus.Timeout ||
+                    (exception.Status == WebExceptionStatus.RequestCanceled && deadline.IsCancellationRequested))
+                    throw new UsageReadException(UiText.T("Claude не ответил за 15 секунд", "Claude did not respond within 15 seconds"));
+                throw new UsageReadException(UiText.T("Нет связи с сервисом Claude", "Cannot reach the Claude service"));
+            }
+            catch (IOException)
+            {
+                if (stop.IsCancellationRequested) throw new OperationCanceledException(stop);
+                if (deadline.IsCancellationRequested)
+                    throw new UsageReadException(UiText.T("Claude не ответил за 15 секунд", "Claude did not respond within 15 seconds"));
+                throw new UsageReadException(UiText.T("Claude закрыл соединение", "Claude closed the connection"));
+            }
+            catch (OperationCanceledException)
+            {
+                if (stop.IsCancellationRequested) throw;
+                throw new UsageReadException(UiText.T("Claude не ответил за 15 секунд", "Claude did not respond within 15 seconds"));
+            }
+            finally
+            {
+                cancel.Dispose();
+                lock (requestLock) { if (active == request) active = null; }
+            }
+        }
+        internal static string CategoryFor(int status)
+        {
+            if (status == 401) return UiText.T("Вход в Claude требует проверки (401)", "Claude sign-in needs attention (401)");
+            if (status == 403) return UiText.T("Сервис Claude отказал в доступе (403)", "Claude service denied access (403)");
+            if (status == 429) return UiText.T("Слишком много запросов к Claude (429)", "Too many requests to Claude (429)");
+            return UiText.T("Ошибка сервиса Claude (" + status.ToString(CultureInfo.InvariantCulture) + ")",
+                "Claude service error (" + status.ToString(CultureInfo.InvariantCulture) + ")");
+        }
+        private void AbortActive()
+        {
+            HttpWebRequest request;
+            lock (requestLock) { request = active; }
+            if (request == null) return;
+            try { request.Abort(); }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+        }
+        public void Dispose()
+        {
+            lock (requestLock) { disposed = true; }
+            AbortActive();
+        }
+    }
+    internal sealed class ClaudeProvider : IUsageProvider
+    {
+        private readonly ClaudeReader reader = new ClaudeReader();
+        private UsageSnapshot snapshot;
+        private string error;
+        public string Id { get { return "Claude"; } }
+        public int Priority { get { return 2; } }
+        public ProviderStatus Status
+        {
+            get { return CodexProvider.ClassifyStatus(Detect(), snapshot, error, DateTimeOffset.UtcNow); }
+        }
+        public ProviderAvailability Detect()
+        {
+            return Classify(UserProcessRunning(), SavedSignInPresent());
+        }
+        public async Task<UsageSnapshot> ReadAsync(CancellationToken stop, int timeoutMilliseconds)
+        {
+            try
+            {
+                UsageSnapshot result = await reader.ReadAsync(stop, timeoutMilliseconds);
+                snapshot = result;
+                error = null;
+                return result;
+            }
+            catch (UsageReadException exception)
+            {
+                error = exception.Message;
+                throw;
+            }
+        }
+        internal static ProviderAvailability Classify(bool processRunning, bool savedSignIn)
+        {
+            if (processRunning) return ProviderAvailability.Active;
+            if (savedSignIn) return ProviderAvailability.Offline;
+            return ProviderAvailability.None;
+        }
+        private static bool UserProcessRunning()
+        {
+            bool found = false;
+            try
+            {
+                foreach (Process process in Process.GetProcessesByName("claude"))
+                {
+                    found = true;
+                    process.Dispose();
+                }
+            }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            return found;
+        }
+        private static bool SavedSignInPresent()
+        {
+            return ClaudeFiles.CredentialsPresent() || ClaudeFiles.DesktopConfigPresent() || ClaudeFiles.DirectoryPresent();
+        }
+        public void Dispose() { reader.Dispose(); }
+    }
+    internal static class OpenCodeFiles
+    {
+        internal static string DataDirectory()
+        {
+            try
+            {
+                string xdg = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
+                if (!String.IsNullOrEmpty(xdg)) return Path.Combine(xdg.Trim(), "opencode");
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".local", "share", "opencode");
+            }
+            catch (ArgumentException) { return null; }
+            catch (System.Security.SecurityException) { return null; }
+        }
+        internal static string DatabasePath()
+        {
+            string directory = DataDirectory();
+            if (String.IsNullOrEmpty(directory)) return null;
+            try { return Path.Combine(directory, "opencode.db"); }
+            catch (ArgumentException) { return null; }
+        }
+        internal static string AuthPath()
+        {
+            string directory = DataDirectory();
+            if (String.IsNullOrEmpty(directory)) return null;
+            try { return Path.Combine(directory, "auth.json"); }
+            catch (ArgumentException) { return null; }
+        }
+        internal static bool DataPresent()
+        {
+            return Exists(DatabasePath()) || Exists(AuthPath());
+        }
+        private static bool Exists(string path)
+        {
+            if (String.IsNullOrEmpty(path)) return false;
+            try { return File.Exists(path); }
+            catch (ArgumentException) { return false; }
+            catch (NotSupportedException) { return false; }
+        }
+    }
+    internal static class OpenCodeLocator
+    {
+        private static string cached;
+        internal static string Find(CancellationToken cancel)
+        {
+            if (!String.IsNullOrEmpty(cached) && File.Exists(cached)) return cached;
+            foreach (string raw in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+            {
+                cancel.ThrowIfCancellationRequested();
+                string directory = raw.Trim().Trim('"');
+                if (!CodexLocator.Absolute(directory)) continue;
+                try
+                {
+                    string path = Path.Combine(directory, "opencode.exe");
+                    if (File.Exists(path)) return cached = Path.GetFullPath(path);
+                    bool shim = File.Exists(Path.Combine(directory, "opencode.cmd")) ||
+                        File.Exists(Path.Combine(directory, "opencode.ps1"));
+                    if (!shim) continue;
+                    path = Path.Combine(directory, "node_modules", "opencode-ai", "bin", "opencode.exe");
+                    if (File.Exists(path)) return cached = Path.GetFullPath(path);
+                }
+                catch (ArgumentException) { }
+                catch (NotSupportedException) { }
+            }
+            throw new UsageReadException(UiText.T("OpenCode CLI не найден", "The OpenCode CLI was not found"));
+        }
+        internal static void ClearCache() { cached = null; }
+    }
+    internal static class OpenCodeUsageParser
+    {
+        internal static UsageSnapshot Parse(string json, DateTimeOffset now)
+        {
+            object parsed;
+            try
+            {
+                parsed = new JavaScriptSerializer { MaxJsonLength = UsageParser.MaxJsonLength, RecursionLimit = 64 }
+                    .DeserializeObject(json);
+            }
+            catch (ArgumentException) { throw new UsageReadException(UiText.T("Повреждённый JSON от OpenCode", "Malformed JSON from OpenCode")); }
+            catch (InvalidOperationException) { throw new UsageReadException(UiText.T("Некорректный ответ OpenCode", "Invalid response from OpenCode")); }
+            object[] rows = parsed as object[];
+            Dictionary<string, object> row = rows != null && rows.Length > 0 ? rows[0] as Dictionary<string, object> : null;
+            double? messages = UsageParser.Number(UsageParser.Field(row, "messages"));
+            double? tokens = UsageParser.Number(UsageParser.Field(row, "tokens"));
+            double? cost = UsageParser.Number(UsageParser.Field(row, "cost"));
+            if (row == null || !messages.HasValue || messages.Value < 0 || messages.Value != Math.Truncate(messages.Value) ||
+                !tokens.HasValue || tokens.Value < 0 || tokens.Value > long.MaxValue || !cost.HasValue || cost.Value < 0)
+                throw new UsageReadException(UiText.T("OpenCode вернул неизвестный формат", "Unexpected response format from OpenCode"));
+            UsageSnapshot snapshot = new UsageSnapshot {
+                FiveHour = new UsageWindow(), Weekly = new UsageWindow(),
+                Credits = new List<ResetCredit>(), ReceivedAtUtc = now
+            };
+            if (messages.Value > 0)
+            {
+                snapshot.TodayTokens = (long)tokens.Value;
+                snapshot.TodayCost = cost.Value;
+            }
+            return snapshot;
+        }
+    }
+    internal sealed class OpenCodeReader : IDisposable
+    {
+        private readonly object processLock = new object();
+        private Process owned;
+        private bool disposed;
+        private bool cleanupFailed;
+        private int reading;
+        internal int OwnedProcessId
+        {
+            get { lock (processLock) { return owned == null ? 0 : owned.Id; } }
+        }
+        internal static long StartOfTodayMilliseconds()
+        {
+            return new DateTimeOffset(DateTime.Today).ToUnixTimeMilliseconds();
+        }
+        internal static string Query(long startMilliseconds)
+        {
+            return "SELECT COUNT(*) AS messages, " +
+                "COALESCE(SUM(json_extract(data,'$.tokens.input')),0)+COALESCE(SUM(json_extract(data,'$.tokens.output')),0)+" +
+                "COALESCE(SUM(json_extract(data,'$.tokens.reasoning')),0)+COALESCE(SUM(json_extract(data,'$.tokens.cache.read')),0)+" +
+                "COALESCE(SUM(json_extract(data,'$.tokens.cache.write')),0) AS tokens, " +
+                "COALESCE(SUM(json_extract(data,'$.cost')),0) AS cost FROM message " +
+                "WHERE json_extract(data,'$.role')='assistant' AND time_created >= " +
+                startMilliseconds.ToString(CultureInfo.InvariantCulture);
+        }
+        internal async Task<UsageSnapshot> ReadAsync(CancellationToken stop, int timeoutMilliseconds)
+        {
+            if (Interlocked.CompareExchange(ref reading, 1, 0) != 0)
+                throw new UsageReadException(UiText.T("Чтение OpenCode уже выполняется", "An OpenCode read is already in progress"));
+            try
+            {
+                using (CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(stop))
+                {
+                    deadline.CancelAfter(timeoutMilliseconds);
+                    return await Task.Run(delegate { return Read(deadline.Token, stop); }).ConfigureAwait(false);
+                }
+            }
+            finally { Interlocked.Exchange(ref reading, 0); }
+        }
+        private UsageSnapshot Read(CancellationToken deadline, CancellationToken stop)
+        {
+            string database = OpenCodeFiles.DatabasePath();
+            if (String.IsNullOrEmpty(database) || !File.Exists(database))
+                throw new UsageReadException(UiText.T("Локальная база OpenCode не найдена", "The local OpenCode database was not found"));
+            string sql = Query(StartOfTodayMilliseconds());
+            Process process = null;
+            Task errors = null;
+            CancellationTokenRegistration cancel = new CancellationTokenRegistration();
+            try
+            {
+                deadline.ThrowIfCancellationRequested();
+                ProcessStartInfo launch = CodexLocator.Hidden(OpenCodeLocator.Find(deadline),
+                    "db \"" + sql + "\" --format json --pure");
+                process = new Process { StartInfo = launch };
+                lock (processLock)
+                {
+                    if (disposed) throw new OperationCanceledException(stop);
+                    if (cleanupFailed) throw new UsageReadException(UiText.T("Предыдущий процесс OpenCode не завершён", "The previous OpenCode process has not exited"));
+                    process.Start();
+                    owned = process;
+                }
+                cancel = deadline.Register(KillOwned);
+                deadline.ThrowIfCancellationRequested();
+                errors = Task.Run(delegate {
+                    try { char[] buffer = new char[4096]; while (process.StandardError.Read(buffer, 0, buffer.Length) != 0) { } }
+                    catch (IOException) { }
+                    catch (ObjectDisposedException) { }
+                    catch (InvalidOperationException) { }
+                });
+                string output = ReadOutput(process, deadline);
+                if (!process.WaitForExit(3000))
+                    throw new UsageReadException(UiText.T("OpenCode CLI не завершился", "The OpenCode CLI did not exit"));
+                deadline.ThrowIfCancellationRequested();
+                stop.ThrowIfCancellationRequested();
+                if (process.ExitCode != 0)
+                    throw new UsageReadException(UiText.T("OpenCode CLI завершился с ошибкой (код ", "The OpenCode CLI exited with an error (code ") +
+                        process.ExitCode.ToString(CultureInfo.InvariantCulture) + ")");
+                return OpenCodeUsageParser.Parse(output, DateTimeOffset.UtcNow);
+            }
+            catch (OperationCanceledException)
+            {
+                if (stop.IsCancellationRequested) throw;
+                throw new UsageReadException(UiText.T("OpenCode не ответил за 15 секунд", "OpenCode did not respond within 15 seconds"));
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                OpenCodeLocator.ClearCache();
+                throw new UsageReadException(UiText.T("Не удалось запустить OpenCode CLI", "Unable to start the OpenCode CLI"));
+            }
+            catch (IOException)
+            {
+                if (stop.IsCancellationRequested) throw new OperationCanceledException(stop);
+                throw new UsageReadException(deadline.IsCancellationRequested ?
+                    UiText.T("OpenCode не ответил за 15 секунд", "OpenCode did not respond within 15 seconds") :
+                    UiText.T("OpenCode закрыл соединение", "OpenCode closed the connection"));
+            }
+            finally
+            {
+                cancel.Dispose();
+                if (process != null)
+                {
+                    bool stopped = true;
+                    try
+                    {
+                        try { process.StandardInput.Close(); } catch (IOException) { } catch (InvalidOperationException) { }
+                        if (!process.WaitForExit(500)) CodexLocator.Stop(process);
+                        stopped = process.HasExited;
+                        if (errors != null) errors.Wait(500);
+                    }
+                    catch (InvalidOperationException) { stopped = true; }
+                    finally
+                    {
+                        lock (processLock)
+                        {
+                            if (owned == process) owned = null;
+                            cleanupFailed = !stopped;
+                        }
+                        process.Dispose();
+                    }
+                    if (cleanupFailed)
+                        throw new UsageReadException(UiText.T("Не удалось завершить собственный процесс OpenCode", "Unable to stop the owned OpenCode process"));
+                }
+            }
+        }
+        private static string ReadOutput(Process process, CancellationToken deadline)
+        {
+            StringBuilder body = new StringBuilder();
+            char[] buffer = new char[4096];
+            while (true)
+            {
+                deadline.ThrowIfCancellationRequested();
+                int count = process.StandardOutput.Read(buffer, 0, buffer.Length);
+                deadline.ThrowIfCancellationRequested();
+                if (count <= 0) break;
+                if (body.Length + count > UsageParser.MaxJsonLength)
+                    throw new UsageReadException(UiText.T("Ответ OpenCode слишком большой", "The OpenCode response is too large"));
+                body.Append(buffer, 0, count);
+            }
+            return body.ToString();
+        }
+        private void KillOwned()
+        {
+            lock (processLock) { if (owned != null) CodexLocator.Stop(owned); }
+        }
+        public void Dispose()
+        {
+            lock (processLock) { disposed = true; }
+            KillOwned();
+        }
+    }
+    internal sealed class OpenCodeProvider : IUsageProvider
+    {
+        private readonly OpenCodeReader reader = new OpenCodeReader();
+        private UsageSnapshot snapshot;
+        private string error;
+        public string Id { get { return "OpenCode"; } }
+        public int Priority { get { return 3; } }
+        public ProviderStatus Status
+        {
+            get { return CodexProvider.ClassifyStatus(Detect(), snapshot, error, DateTimeOffset.UtcNow); }
+        }
+        public ProviderAvailability Detect()
+        {
+            return Classify(UserProcessRunning(), OpenCodeFiles.DataPresent());
+        }
+        public async Task<UsageSnapshot> ReadAsync(CancellationToken stop, int timeoutMilliseconds)
+        {
+            try
+            {
+                UsageSnapshot result = await reader.ReadAsync(stop, timeoutMilliseconds);
+                snapshot = result;
+                error = null;
+                return result;
+            }
+            catch (UsageReadException exception)
+            {
+                error = exception.Message;
+                throw;
+            }
+        }
+        internal static ProviderAvailability Classify(bool processRunning, bool dataPresent)
+        {
+            if (processRunning) return ProviderAvailability.Active;
+            if (dataPresent) return ProviderAvailability.Offline;
+            return ProviderAvailability.None;
+        }
+        private bool UserProcessRunning()
+        {
+            int owned = reader.OwnedProcessId;
+            bool found = false;
+            try
+            {
+                foreach (Process process in Process.GetProcessesByName("opencode"))
+                {
+                    try { found = found || process.Id != owned; }
+                    catch (InvalidOperationException) { }
+                    finally { process.Dispose(); }
+                }
+            }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            return found;
+        }
+        public void Dispose() { reader.Dispose(); }
+    }
+    internal static class ProviderRegistry
+    {
+        internal static IUsageProvider[] Create()
+        {
+            return new IUsageProvider[] { new CodexProvider(), new ClaudeProvider(), new OpenCodeProvider() };
+        }
+    }
     internal static class Program
     {
         [STAThread]
         private static void Main(string[] args)
         {
             Native.EnableDpi();
-            if (Array.IndexOf(args, "--with-codex") >= 0)
+            if (Array.IndexOf(args, "--with-codex") >= 0) OpenCodex();
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            using (TrayContext app = new TrayContext(ProviderRegistry.Create(), true)) Application.Run(app);
+        }
+        private static void OpenCodex()
+        {
+            try
             {
-                try
-                {
-                    using (Process launcher = Process.Start(new ProcessStartInfo(
-                        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
-                        @"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App") { UseShellExecute = true })) { }
-                }
-                catch (System.ComponentModel.Win32Exception exception)
-                {
-                    MessageBox.Show(UiText.T("Не удалось открыть Codex:\n", "Could not open Codex:\n") + exception.Message,
-                        "AI Usage Tray", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                }
+                using (Process launcher = Process.Start(new ProcessStartInfo(
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+                    @"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App") { UseShellExecute = true })) { }
             }
-            bool first;
-            using (Mutex mutex = new Mutex(true, @"Local\AIUsageTray.SingleInstance", out first))
+            catch (System.ComponentModel.Win32Exception exception)
             {
-                if (!first) return;
-                Application.EnableVisualStyles();
-                Application.SetCompatibleTextRenderingDefault(false);
-                try { using (TrayContext app = new TrayContext(true)) Application.Run(app); }
-                finally { mutex.ReleaseMutex(); }
+                MessageBox.Show(UiText.T("Не удалось открыть Codex:\n", "Could not open Codex:\n") + exception.Message,
+                    "AI Usage Tray", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
     }
@@ -1117,6 +2096,21 @@ namespace AIUsageTray
                 catch (IOException) { return false; }
                 catch (UnauthorizedAccessException) { return false; }
             }
+        }
+        internal static bool TrayDark
+        {
+            get
+            {
+                if (SystemInformation.HighContrast) return DarkBackground(SystemColors.Window);
+                try { return Object.Equals(Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "SystemUsesLightTheme", 1), 0); }
+                catch (System.Security.SecurityException) { return false; }
+                catch (IOException) { return false; }
+                catch (UnauthorizedAccessException) { return false; }
+            }
+        }
+        internal static bool DarkBackground(Color background)
+        {
+            return background.R + background.G + background.B < 384;
         }
         [StructLayout(LayoutKind.Sequential)] private struct Margins { internal int Left, Right, Top, Bottom; }
         [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
