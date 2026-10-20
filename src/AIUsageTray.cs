@@ -69,6 +69,7 @@ namespace AIUsageTray
         internal SubscriptionMetadata Subscription { get; set; }
         internal long? TodayTokens { get; set; }
         internal double? TodayCost { get; set; }
+        internal OpenCodeUsageReport OpenCode { get; set; }
     }
     internal static class UsageParser
     {
@@ -1823,38 +1824,6 @@ namespace AIUsageTray
         }
         internal static void ClearCache() { cached = null; }
     }
-    internal static class OpenCodeUsageParser
-    {
-        internal static UsageSnapshot Parse(string json, DateTimeOffset now)
-        {
-            object parsed;
-            try
-            {
-                parsed = new JavaScriptSerializer { MaxJsonLength = UsageParser.MaxJsonLength, RecursionLimit = 64 }
-                    .DeserializeObject(json);
-            }
-            catch (ArgumentException) { throw new UsageReadException(UiText.T("Повреждённый JSON от OpenCode", "Malformed JSON from OpenCode")); }
-            catch (InvalidOperationException) { throw new UsageReadException(UiText.T("Некорректный ответ OpenCode", "Invalid response from OpenCode")); }
-            object[] rows = parsed as object[];
-            Dictionary<string, object> row = rows != null && rows.Length > 0 ? rows[0] as Dictionary<string, object> : null;
-            double? messages = UsageParser.Number(UsageParser.Field(row, "messages"));
-            double? tokens = UsageParser.Number(UsageParser.Field(row, "tokens"));
-            double? cost = UsageParser.Number(UsageParser.Field(row, "cost"));
-            if (row == null || !messages.HasValue || messages.Value < 0 || messages.Value != Math.Truncate(messages.Value) ||
-                !tokens.HasValue || tokens.Value < 0 || tokens.Value > long.MaxValue || !cost.HasValue || cost.Value < 0)
-                throw new UsageReadException(UiText.T("OpenCode вернул неизвестный формат", "Unexpected response format from OpenCode"));
-            UsageSnapshot snapshot = new UsageSnapshot {
-                FiveHour = new UsageWindow(), Weekly = new UsageWindow(),
-                Credits = new List<ResetCredit>(), ReceivedAtUtc = now
-            };
-            if (messages.Value > 0)
-            {
-                snapshot.TodayTokens = (long)tokens.Value;
-                snapshot.TodayCost = cost.Value;
-            }
-            return snapshot;
-        }
-    }
     internal sealed class OpenCodeReader : IDisposable
     {
         private readonly object processLock = new object();
@@ -1865,20 +1834,6 @@ namespace AIUsageTray
         internal int OwnedProcessId
         {
             get { lock (processLock) { return owned == null ? 0 : owned.Id; } }
-        }
-        internal static long StartOfTodayMilliseconds()
-        {
-            return new DateTimeOffset(DateTime.Today).ToUnixTimeMilliseconds();
-        }
-        internal static string Query(long startMilliseconds)
-        {
-            return "SELECT COUNT(*) AS messages, " +
-                "COALESCE(SUM(json_extract(data,'$.tokens.input')),0)+COALESCE(SUM(json_extract(data,'$.tokens.output')),0)+" +
-                "COALESCE(SUM(json_extract(data,'$.tokens.reasoning')),0)+COALESCE(SUM(json_extract(data,'$.tokens.cache.read')),0)+" +
-                "COALESCE(SUM(json_extract(data,'$.tokens.cache.write')),0) AS tokens, " +
-                "COALESCE(SUM(json_extract(data,'$.cost')),0) AS cost FROM message " +
-                "WHERE json_extract(data,'$.role')='assistant' AND time_created >= " +
-                startMilliseconds.ToString(CultureInfo.InvariantCulture);
         }
         internal async Task<UsageSnapshot> ReadAsync(CancellationToken stop, int timeoutMilliseconds)
         {
@@ -1899,7 +1854,9 @@ namespace AIUsageTray
             string database = OpenCodeFiles.DatabasePath();
             if (String.IsNullOrEmpty(database) || !File.Exists(database))
                 throw new UsageReadException(UiText.T("Локальная база OpenCode не найдена", "The local OpenCode database was not found"));
-            string sql = Query(StartOfTodayMilliseconds());
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            long start = OpenCodeUsageParser.StartOfUtcDay(now);
+            string sql = OpenCodeUsageParser.Query(start, start + OpenCodeUsageParser.DayMilliseconds);
             Process process = null;
             Task errors = null;
             CancellationTokenRegistration cancel = new CancellationTokenRegistration();
@@ -1932,7 +1889,8 @@ namespace AIUsageTray
                 if (process.ExitCode != 0)
                     throw new UsageReadException(UiText.T("OpenCode CLI завершился с ошибкой (код ", "The OpenCode CLI exited with an error (code ") +
                         process.ExitCode.ToString(CultureInfo.InvariantCulture) + ")");
-                return OpenCodeUsageParser.Parse(output, DateTimeOffset.UtcNow);
+                OpenCodeUsageReport report = OpenCodeUsageParser.Parse(output, now);
+                return OpenCodeUsageParser.Snapshot(report, now);
             }
             catch (OperationCanceledException)
             {
