@@ -70,6 +70,7 @@ namespace AIUsageTray
         internal long? TodayTokens { get; set; }
         internal double? TodayCost { get; set; }
         internal OpenCodeUsageReport OpenCode { get; set; }
+        internal ZenQuotaReport ZenQuota { get; set; }
     }
     internal static class UsageParser
     {
@@ -1968,6 +1969,7 @@ namespace AIUsageTray
         private readonly OpenCodeReader reader = new OpenCodeReader();
         private UsageSnapshot snapshot;
         private string error;
+        internal ZenIpState IpState { get; set; }
         public string Id { get { return "OpenCode"; } }
         public int Priority { get { return 3; } }
         public ProviderStatus Status
@@ -1983,6 +1985,8 @@ namespace AIUsageTray
             try
             {
                 UsageSnapshot result = await reader.ReadAsync(stop, timeoutMilliseconds);
+                if (IpState != ZenIpState.Unknown)
+                    result.ZenQuota = ZenQuotaCalculator.Calculate(result.OpenCode, IpState, result.ReceivedAtUtc);
                 snapshot = result;
                 error = null;
                 return result;

@@ -353,11 +353,13 @@ namespace AIUsageTray
 
         internal static UsageSnapshot Snapshot(OpenCodeUsageReport report, DateTimeOffset now)
         {
-            return new UsageSnapshot {
+            UsageSnapshot snapshot = new UsageSnapshot {
                 FiveHour = new UsageWindow(), Weekly = new UsageWindow(),
                 Credits = new List<ResetCredit>(), ReceivedAtUtc = now,
                 TodayTokens = report.Tokens, TodayCost = report.Cost, OpenCode = report
             };
+            snapshot.ZenQuota = ZenQuotaCalculator.Calculate(report, ZenIpState.Unknown, now);
+            return snapshot;
         }
     }
 }
