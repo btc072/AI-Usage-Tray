@@ -943,6 +943,7 @@ namespace AIUsageTray
         internal readonly int TaskbarCreated = Native.RegisterWindowMessage("TaskbarCreated");
         internal Action<int, Point> Callback { get; set; }
         internal Action SessionEnded { get; set; }
+        internal Action DisplayChanged { get; set; }
         internal string Tip { get; set; }
         internal bool Registered { get; private set; }
         internal int RegistrationCount { get; private set; }
@@ -996,7 +997,11 @@ namespace AIUsageTray
         }
         protected override void WndProc(ref Message message)
         {
-            if (message.Msg == TaskbarCreated) { Registered = false; Restore(); }
+            if (message.Msg == TaskbarCreated) { Registered = false; Restore(); if (DisplayChanged != null) DisplayChanged(); }
+            else if (message.Msg == 0x001A || message.Msg == 0x031A || message.Msg == 0x007E || message.Msg == 0x02E0)
+            {
+                if (DisplayChanged != null) DisplayChanged();
+            }
             else if (message.Msg == CallbackMessage)
             {
                 long value = message.LParam.ToInt64();
@@ -1030,6 +1035,7 @@ namespace AIUsageTray
         private readonly System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer { Interval = 1 };
         private readonly System.Windows.Forms.Timer hover = new System.Windows.Forms.Timer { Interval = 100 };
         private readonly System.Windows.Forms.Timer open = new System.Windows.Forms.Timer { Interval = 500 };
+        private readonly System.Windows.Forms.Timer redraw = new System.Windows.Forms.Timer { Interval = 200 };
         private readonly ContextMenuStrip menu = new ContextMenuStrip();
         internal readonly TrayWindow Tray = new TrayWindow();
         internal readonly PopupForm Popup;
@@ -1051,6 +1057,8 @@ namespace AIUsageTray
             Tray.Tip = TipFor(null);
             Tray.Callback = OnTray;
             Tray.SessionEnded = ExitThread;
+            Tray.DisplayChanged = RedrawIcon;
+            redraw.Tick += delegate { redraw.Stop(); if (!exiting) DrawIcon(); };
             foreach (IUsageProvider candidate in providers)
             {
                 IUsageProvider next = candidate;
@@ -1093,10 +1101,9 @@ namespace AIUsageTray
         }
         private static string TipFor(string providerId)
         {
-            return providerId == null ? UiText.T("Выберите провайдера в меню", "Choose a provider in the menu") :
-                providerId + " · " + (providerId == "OpenCode" ?
-                    UiText.T("сверху токены за сегодня, снизу стоимость", "top: tokens today, bottom: cost") :
-                    UiText.T("сверху 5 ч, снизу неделя", "top: 5 hours, bottom: week"));
+            if (providerId == null) return UiText.T("Выберите провайдера в меню", "Choose a provider in the menu");
+            if (providerId == "OpenCode") return "OpenCode · " + UiText.T("бесплатная квота Zen", "Zen free quota");
+            return providerId + " · " + UiText.T("сверху 5 ч, снизу неделя", "top: 5 hours, bottom: week");
         }
         private Task Refresh()
         {
@@ -1174,21 +1181,14 @@ namespace AIUsageTray
             Icon replacement;
             if (provider != null && provider.Id == "OpenCode")
             {
-                long? tokens = snapshot == null ? null : snapshot.TodayTokens;
-                double? cost = snapshot == null ? null : snapshot.TodayCost;
-                Color neutral = Native.TrayDark ? Color.White : Color.FromArgb(32, 32, 32);
-                Color missing = TrayIconRenderer.ColorFor(null, true);
-                string top = TrayIconRenderer.FormatTokensCompact(tokens);
-                string bottom = TrayIconRenderer.FormatCost(cost);
-                Color topColor = tokens.HasValue ? neutral : missing;
-                Color bottomColor = cost.HasValue ? neutral : missing;
-                next = top + ":" + topColor.ToArgb() + "/" + bottom + ":" + bottomColor.ToArgb() + "/" + pixels;
+                bool dark = Native.TrayDark;
+                next = "opencode:" + pixels + ":" + (dark ? "dark" : "light");
                 if (next == signature)
                 {
                     if (!Tray.Registered) Tray.Restore();
                     return;
                 }
-                replacement = TrayIconRenderer.Create(top, bottom, topColor, bottomColor, pixels);
+                replacement = OpenCodeIcon.Get(pixels, dark);
             }
             else
             {
@@ -1207,6 +1207,14 @@ namespace AIUsageTray
             if (icon != null) icon.Dispose();
             icon = replacement;
             signature = next;
+        }
+        private void RedrawIcon()
+        {
+            if (exiting) return;
+            signature = null;
+            if (provider != null && provider.Id == "OpenCode") OpenCodeIcon.ClearCache();
+            redraw.Stop();
+            redraw.Start();
         }
         private void OnTray(int code, Point point)
         {
@@ -1262,14 +1270,15 @@ namespace AIUsageTray
         {
             if (exiting) return;
             exiting = true;
-            poll.Stop(); hover.Stop(); open.Stop();
+            poll.Stop(); hover.Stop(); open.Stop(); redraw.Stop();
             stop.Cancel();
             foreach (IUsageProvider candidate in providers) candidate.Dispose();
             Tray.Dispose();
+            OpenCodeIcon.ClearCache();
             Popup.Dispose();
             menu.Dispose();
             if (icon != null) icon.Dispose();
-            poll.Dispose(); hover.Dispose(); open.Dispose();
+            poll.Dispose(); hover.Dispose(); open.Dispose(); redraw.Dispose();
             base.ExitThreadCore();
         }
     }
