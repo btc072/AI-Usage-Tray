@@ -40,12 +40,14 @@ namespace AIUsageTray
         internal DateTimeOffset? ResetUtc { get; set; }
         internal DateTimeOffset? ObservedResetUtc { get; set; }
         internal bool ResetFromRetryAfter { get; set; }
+        internal DateTimeOffset? UtcResetUtc { get; set; }
         internal bool Exhausted { get; set; }
         internal string ExhaustedModel { get; set; }
         internal bool LimitNotDetected { get; set; }
         internal bool Partial { get; set; }
         internal bool Aborted { get; set; }
         internal bool HasUnknownError { get; set; }
+        internal bool HasFreeLimitError { get; set; }
         internal string UnknownErrorModel { get; set; }
         internal bool HasData { get; set; }
         internal List<ZenModelQuota> Models { get; set; }
@@ -70,15 +72,25 @@ namespace AIUsageTray
             report.Reliability = ZenReliability.None;
             if (usage == null) return report;
 
+            report.UtcResetUtc = usage.ResetUtc;
             report.ResetUtc = usage.ResetUtc;
-            report.ObservedResetUtc = usage.ObservedResetUtc;
-            report.ResetFromRetryAfter = usage.ResetFromRetryAfter;
+            report.ResetFromRetryAfter = false;
+            if (usage.ObservedResetUtc.HasValue && usage.ObservedResetUtc.Value > now)
+            {
+                report.ObservedResetUtc = usage.ObservedResetUtc;
+                if (usage.ObservedResetUtc.Value != usage.ResetUtc)
+                {
+                    report.ResetUtc = usage.ObservedResetUtc;
+                    report.ResetFromRetryAfter = true;
+                }
+            }
             report.Exhausted = usage.LimitExhausted;
             report.ExhaustedModel = usage.ExhaustedModel;
             report.LimitNotDetected = usage.LimitNotDetected;
             report.Partial = usage.Partial;
             report.Aborted = usage.Aborted;
             report.HasUnknownError = usage.HasUnknownError;
+            report.HasFreeLimitError = usage.HasFreeLimitError;
             report.UnknownErrorModel = usage.UnknownErrorModel;
 
             int used = usage.UsedObserved;
@@ -109,7 +121,7 @@ namespace AIUsageTray
             report.Reliability = Reliability(usage, used, now);
             report.RequestsPerHour = CalculateRate(usage, used, now);
             report.ExhaustionForecastUtc = CalculateForecast(
-                report.RequestsPerHour, report.Remaining, usage.ResetUtc, now);
+                report.RequestsPerHour, report.Remaining, report.ResetUtc, now);
             AddModels(report, usage);
             AddDiagnosticGroups(report, usage);
             return report;

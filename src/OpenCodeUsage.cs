@@ -19,6 +19,7 @@ namespace AIUsageTray
         internal long? Tokens { get; set; }
         internal double? Cost { get; set; }
         internal bool FreeLimit { get; set; }
+        internal bool FreeLimitEvidence { get; set; }
         internal bool Aborted { get; set; }
         internal bool Partial { get; set; }
         internal DateTimeOffset? RetryAfterResetUtc { get; set; }
@@ -43,6 +44,7 @@ namespace AIUsageTray
         internal int UsedObserved { get; set; }
         internal bool Partial { get; set; }
         internal bool HasUnknownError { get; set; }
+        internal bool HasFreeLimitError { get; set; }
         internal string UnknownErrorModel { get; set; }
         internal bool LimitExhausted { get; set; }
         internal string ExhaustedModel { get; set; }
@@ -79,14 +81,14 @@ namespace AIUsageTray
                 "AND json_extract(m.data,'$.providerID') = 'opencode' " +
                 "AND p.time_created >= " + start + " AND p.time_created < " + end + " " +
                 "UNION ALL " +
-                "SELECT 'error' AS source, m.id AS message_id, m.time_created AS at, " +
+                "SELECT 'error' AS source, m.id AS message_id, " +
+                "COALESCE(json_extract(m.data,'$.time.completed'), m.time_created) AS at, " +
                 "m.data AS message_data, NULL AS part_data " +
                 "FROM message m " +
                 "WHERE json_extract(m.data,'$.role') = 'assistant' " +
                 "AND json_extract(m.data,'$.error') IS NOT NULL " +
-                "AND m.time_created >= " + start + " AND m.time_created < " + end + " " +
-                "AND NOT EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id " +
-                "AND json_extract(p.data,'$.type') = 'step-finish') " +
+                "AND COALESCE(json_extract(m.data,'$.time.completed'), m.time_created) >= " + start +
+                " AND COALESCE(json_extract(m.data,'$.time.completed'), m.time_created) < " + end + " " +
                 "ORDER BY at";
         }
 
@@ -133,20 +135,48 @@ namespace AIUsageTray
             {
                 text = text.Trim();
                 long seconds;
-                if (Int64.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out seconds))
-                    return AddSeconds(atUtc, seconds);
-                if (DigitsOnly(text)) return null;
+                if (DigitsOnly(text))
+                {
+                    if (Int64.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out seconds))
+                        return AddSeconds(atUtc, seconds);
+                    return null;
+                }
                 if (text.Length > 0 && (Char.IsDigit(text[0]) || text[0] == '+' || text[0] == '-') &&
                     (text.IndexOf('.') >= 0 || text.IndexOf(',') >= 0)) return null;
                 DateTimeOffset date;
-                if (DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture,
-                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out date))
+                if (TryParseHttpDate(text, out date))
                     return date > atUtc ? date : (DateTimeOffset?)null;
                 return null;
             }
             double? number = UsageParser.Number(raw);
-            return number.HasValue && number.Value > 0 && number.Value <= Int64.MaxValue ?
+            return number.HasValue && number.Value > 0 && number.Value <= Int64.MaxValue &&
+                Math.Truncate(number.Value) == number.Value ?
                 AddSeconds(atUtc, (long)number.Value) : (DateTimeOffset?)null;
+        }
+
+        private static bool TryParseHttpDate(string text, out DateTimeOffset value)
+        {
+            string[] formats = {
+                "ddd, dd MMM yyyy HH:mm:ss 'GMT'",
+                "dddd, dd-MMM-yy HH:mm:ss 'GMT'",
+                "ddd MMM d HH:mm:ss yyyy",
+                "ddd MMM  d HH:mm:ss yyyy"
+            };
+            if (!DateTimeOffset.TryParseExact(text, formats, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out value))
+                return false;
+            string asctime = value.Day < 10 ?
+                value.ToString("ddd MMM  d HH:mm:ss yyyy", CultureInfo.InvariantCulture) :
+                value.ToString("ddd MMM d HH:mm:ss yyyy", CultureInfo.InvariantCulture);
+            string[] canonical = {
+                value.ToString("r", CultureInfo.InvariantCulture),
+                value.ToString("dddd, dd-MMM-yy HH:mm:ss 'GMT'", CultureInfo.InvariantCulture),
+                asctime
+            };
+            foreach (string form in canonical)
+                if (String.Equals(text, form, StringComparison.Ordinal)) return true;
+            value = default(DateTimeOffset);
+            return false;
         }
 
         private static DateTimeOffset? AddSeconds(DateTimeOffset atUtc, long seconds)
@@ -159,9 +189,7 @@ namespace AIUsageTray
         private static bool DigitsOnly(string text)
         {
             if (String.IsNullOrEmpty(text)) return false;
-            int start = text[0] == '+' || text[0] == '-' ? 1 : 0;
-            if (start == text.Length) return false;
-            for (int i = start; i < text.Length; i++)
+            for (int i = 0; i < text.Length; i++)
                 if (text[i] < '0' || text[i] > '9') return false;
             return true;
         }
@@ -208,7 +236,8 @@ namespace AIUsageTray
             }
             foreach (OpenCodeObservation error in errors)
             {
-                if (steps.ContainsKey(error.MessageId)) continue;
+                OpenCodeObservation step;
+                if (steps.TryGetValue(error.MessageId, out step)) { MergeError(step, error); continue; }
                 report.Observations.Add(error);
             }
             report.Observations.Sort(delegate(OpenCodeObservation left, OpenCodeObservation right) {
@@ -224,6 +253,7 @@ namespace AIUsageTray
             foreach (OpenCodeObservation observation in report.Observations)
             {
                 if (observation.Partial) report.Partial = true;
+                if (observation.FreeLimitEvidence) report.HasFreeLimitError = true;
                 if (observation.Class == OpenCodeObservationClass.UnknownError)
                 {
                     report.HasUnknownError = true;
@@ -243,8 +273,9 @@ namespace AIUsageTray
                 }
                 if (observation.Class != OpenCodeObservationClass.ZenQuota) continue;
                 if (observation.Aborted) report.Aborted = true;
-                if (observation.FreeLimit) report.LimitExhausted = true;
-                if (observation.FreeLimit && report.ExhaustedModel == null) report.ExhaustedModel = observation.Model;
+                if (observation.FreeLimit || observation.FreeLimitEvidence) report.LimitExhausted = true;
+                if ((observation.FreeLimit || observation.FreeLimitEvidence) && report.ExhaustedModel == null)
+                    report.ExhaustedModel = observation.Model;
                 if (observation.RetryAfterResetUtc.HasValue &&
                     (!report.ObservedResetUtc.HasValue || observation.RetryAfterResetUtc.Value > report.ObservedResetUtc.Value))
                     report.ObservedResetUtc = observation.RetryAfterResetUtc;
@@ -264,7 +295,7 @@ namespace AIUsageTray
                     catch (OverflowException) { model.Tokens = null; model.TokensPartial = true; }
                 }
                 else if (observation.Source == OpenCodeObservationSource.Step) model.TokensPartial = true;
-                if (observation.FreeLimit) model.Exhausted = true;
+                if (observation.FreeLimit || observation.FreeLimitEvidence) model.Exhausted = true;
             }
             report.Tokens = hasTokens && !tokenOverflow ? (long?)tokens : null;
             report.Cost = hasCost && !Double.IsInfinity(cost) ? (double?)cost : null;
@@ -274,8 +305,17 @@ namespace AIUsageTray
                 int byCount = right.Observations.CompareTo(left.Observations);
                 return byCount != 0 ? byCount : String.CompareOrdinal(left.Model, right.Model);
             });
-            report.LimitNotDetected = report.UsedObserved > 0 && !report.LimitExhausted;
+            report.LimitNotDetected = report.UsedObserved > 0 && !report.LimitExhausted && !report.HasFreeLimitError;
             return report;
+        }
+
+        private static void MergeError(OpenCodeObservation step, OpenCodeObservation error)
+        {
+            step.FreeLimitEvidence = step.FreeLimitEvidence || error.FreeLimitEvidence;
+            step.Aborted = step.Aborted || error.Aborted;
+            if (error.RetryAfterResetUtc.HasValue &&
+                (!step.RetryAfterResetUtc.HasValue || error.RetryAfterResetUtc.Value > step.RetryAfterResetUtc.Value))
+                step.RetryAfterResetUtc = error.RetryAfterResetUtc;
         }
 
         private static OpenCodeObservation ParseRow(Dictionary<string, object> row)
@@ -333,7 +373,7 @@ namespace AIUsageTray
             bool aborted = errorName != null && errorName.IndexOf("MessageAbortedError", StringComparison.OrdinalIgnoreCase) >= 0;
             OpenCodeObservation result = new OpenCodeObservation {
                 MessageId = messageId, AtUtc = atUtc, Provider = provider, Model = model,
-                Source = OpenCodeObservationSource.Error, FreeLimit = freeLimit, Aborted = aborted,
+                Source = OpenCodeObservationSource.Error, FreeLimit = freeLimit, FreeLimitEvidence = freeLimit, Aborted = aborted,
                 RetryAfterResetUtc = RetryAfterReset(error, atUtc)
             };
             if (provider == null || model == null) result.Class = OpenCodeObservationClass.UnknownError;
