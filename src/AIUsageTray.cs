@@ -631,6 +631,7 @@ namespace AIUsageTray
         private int padding;
         private Label fiveCountdown;
         private Label weekCountdown;
+        private Label quotaCountdown;
         private Label status;
         private string provider;
         private UsageSnapshot snapshot;
@@ -725,6 +726,7 @@ namespace AIUsageTray
                 while (body.Controls.Count != 0) body.Controls[0].Dispose();
                 fiveCountdown = null;
                 weekCountdown = null;
+                quotaCountdown = null;
                 if (normal != null) normal.Dispose();
                 if (bold != null) bold.Dispose();
                 dpi = newDpi;
@@ -743,12 +745,7 @@ namespace AIUsageTray
                 AddTitle(title, plan, 10);
                 if (provider == "OpenCode")
                 {
-                    string tokens = snapshot != null && snapshot.TodayTokens.HasValue ?
-                        TrayIconRenderer.FormatTokensFull(snapshot.TodayTokens) : UiText.T("нет данных", "not available");
-                    string cost = snapshot != null && snapshot.TodayCost.HasValue ?
-                        TrayIconRenderer.FormatCost(snapshot.TodayCost) : UiText.T("нет данных", "not available");
-                    Add(UiText.T("Токены за сегодня", "Tokens today") + " - " + tokens, 2, true);
-                    Add(UiText.T("Стоимость за сегодня (оценка)", "Cost today (estimated)") + " - " + cost, 10, true);
+                    BuildOpenCode(DateTimeOffset.UtcNow);
                 }
                 else if (provider != null)
                 {
@@ -784,6 +781,112 @@ namespace AIUsageTray
             }
             finally { body.ResumeLayout(); ResumeLayout(); }
         }
+        private void BuildOpenCode(DateTimeOffset now)
+        {
+            ZenQuotaReport quota = snapshot == null ? null : snapshot.ZenQuota;
+            bool hasData = quota != null && quota.HasData;
+            string connection;
+            if (!hasData) connection = UiText.T("нет данных", "not available");
+            else
+            {
+                bool cli = true;
+                try { OpenCodeLocator.Find(CancellationToken.None); }
+                catch (UsageReadException) { cli = false; }
+                connection = cli ?
+                    UiText.T("локальная база (opencode db)", "local database (opencode db)") :
+                    UiText.T("локальная база; CLI не найден", "local database; CLI not found");
+            }
+            Add(UiText.T("Подключение: ", "Connection: ") + connection, 10);
+            Add(UiText.T("Бесплатная квота Zen (оценка, UTC)", "Zen free quota (estimate, UTC)"), 10, true);
+
+            string noData = UiText.T("нет данных", "not available");
+            string used = hasData ?
+                quota.UsedObserved.ToString(CultureInfo.CurrentCulture) + UiText.T(" из ~", " of ~") +
+                quota.BaseLimit.ToString(CultureInfo.CurrentCulture) + UiText.T(" запросов", " requests") : noData;
+            Add(UiText.T("Использовано: ", "Used: ") + used, 2);
+
+            string remaining = noData;
+            if (hasData && quota.Remaining.HasValue && quota.Percent.HasValue)
+                remaining = "~" + quota.Remaining.Value.ToString(CultureInfo.CurrentCulture) +
+                    " (" + quota.Percent.Value.ToString("0.#", CultureInfo.CurrentCulture) + "%)";
+            Add(UiText.T("Остаток: ", "Remaining: ") + remaining, 2);
+
+            if (hasData && quota.Remaining.HasValue && quota.RemainingUpperBound.HasValue &&
+                quota.RemainingUpperBound.Value > quota.Remaining.Value)
+                Add(UiText.T("Диапазон: ", "Range: ") + quota.Remaining.Value.ToString(CultureInfo.CurrentCulture) +
+                    "–" + quota.RemainingUpperBound.Value.ToString(CultureInfo.CurrentCulture), 2);
+
+            if (hasData && quota.ExhaustionForecastUtc.HasValue)
+                Add(UiText.T("Исчерпание ожидается: ", "Exhaustion expected: ") + LocalDate(quota.ExhaustionForecastUtc.Value), 2);
+
+            Label timer = Add(UiText.T("До сброса: ", "Time to reset: ") +
+                Countdown(hasData ? quota.ResetUtc : null, now), 2);
+            quotaCountdown = timer;
+
+            string reset = noData;
+            if (hasData && quota.ResetUtc.HasValue)
+                reset = LocalDate(quota.ResetUtc.Value) +
+                    (quota.ResetFromRetryAfter ? " (Retry-After)" : " (UTC)");
+            Add(UiText.T("Сброс: ", "Reset: ") + reset, 10);
+
+            Add(UiText.T("Достоверность: ", "Confidence: ") + ReliabilityText(quota, hasData), 2);
+            Add(ExhaustionText(quota, hasData), 10);
+
+            if (quota != null && quota.HasUnknownError)
+            {
+                string model = String.IsNullOrEmpty(quota.UnknownErrorModel) ? "" : " (" + quota.UnknownErrorModel + ")";
+                Add(UiText.T("Неизвестная ошибка", "Unknown error") + model, 10);
+            }
+
+            if (quota != null && quota.Models != null && quota.Models.Count > 0)
+            {
+                Add(UiText.T("Модели:", "Models:"), 6, true);
+                foreach (ZenModelQuota model in quota.Models) Add(ModelLine(model), 2);
+            }
+
+            string tokens = snapshot != null && snapshot.TodayTokens.HasValue ?
+                TrayIconRenderer.FormatTokensFull(snapshot.TodayTokens) : noData;
+            string cost = snapshot != null && snapshot.TodayCost.HasValue ?
+                TrayIconRenderer.FormatCost(snapshot.TodayCost) : noData;
+            Add(UiText.T("Токены за сегодня (UTC): ", "Tokens today (UTC): ") + tokens, 10);
+            Add(UiText.T("Стоимость за сегодня (оценка): ", "Cost today (estimated): ") + cost, 2);
+        }
+
+        private static string ReliabilityText(ZenQuotaReport quota, bool hasData)
+        {
+            if (!hasData || quota == null) return UiText.T("нет данных", "not available");
+            if (quota.Reliability == ZenReliability.High) return UiText.T("высокая", "high");
+            if (quota.Reliability == ZenReliability.Medium) return UiText.T("средняя", "medium");
+            if (quota.Reliability == ZenReliability.Low) return UiText.T("низкая", "low");
+            return UiText.T("нет данных", "not available");
+        }
+
+        private static string ExhaustionText(ZenQuotaReport quota, bool hasData)
+        {
+            if (!hasData || quota == null) return UiText.T("Исчерпание: нет данных", "Exhaustion: not available");
+            if (quota.Exhausted)
+            {
+                string model = String.IsNullOrEmpty(quota.ExhaustedModel) ? "" : " (" + quota.ExhaustedModel + ")";
+                return UiText.T("Исчерпание: обнаружено", "Exhaustion: detected") + model;
+            }
+            if (quota.LimitNotDetected) return UiText.T("Исчерпание: не обнаружено", "Exhaustion: not detected");
+            return UiText.T("Исчерпание: нет данных", "Exhaustion: not available");
+        }
+
+        private static string ModelLine(ZenModelQuota model)
+        {
+            string text = UiText.T("Модель: ", "Model: ") + (model.Model ?? "—") + " — " +
+                model.Observations.ToString(CultureInfo.CurrentCulture) +
+                UiText.T(" наблюдений", " observations");
+            if (model.Tokens.HasValue)
+                text += UiText.T("; токены ", "; tokens ") + TrayIconRenderer.FormatTokensFull(model.Tokens);
+            if (model.LimitKnown && model.DailyLimit.HasValue)
+                text += UiText.T("; лимит: ", "; limit: ") + model.DailyLimit.Value.ToString(CultureInfo.CurrentCulture);
+            text += model.Exhausted ? UiText.T("; исчерпание: да", "; exhaustion: yes") :
+                UiText.T("; исчерпание: нет", "; exhaustion: no");
+            return text;
+        }
+
         private void Window(UsageWindow window, bool five)
         {
             string percent = window.Remaining.HasValue ?
@@ -828,9 +931,11 @@ namespace AIUsageTray
                 int scrollbar = 0;
                 int frameWidth = Width - ClientSize.Width;
                 int maxHeight = Math.Max(1, work.Height - 8 - (Height - ClientSize.Height));
+                // Wider OpenCode rows need a small GDI measurement margin.
+                int safety = String.Equals(provider, "OpenCode", StringComparison.Ordinal) ? 24 : 0;
                 for (int pass = 0; pass < 2; pass++)
                 {
-                    int width = Math.Min(Math.Max(1, work.Width - ScreenGap - frameWidth), longest + padding * 2 + scrollbar);
+                    int width = Math.Min(Math.Max(1, work.Width - ScreenGap - frameWidth), longest + padding * 2 + scrollbar + safety);
                     int rowWidth = Math.Max(1, width - padding * 2 - scrollbar);
                     int rowY = padding;
                     foreach (Control label in body.Controls)
@@ -839,7 +944,16 @@ namespace AIUsageTray
                         if (label.Text.Length == 0) { label.Bounds = Rectangle.Empty; continue; }
                         Size measured = TextRenderer.MeasureText(label.Text, label.Font,
                             new Size(rowWidth, Int32.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix);
-                        label.Bounds = new Rectangle(padding, rowY, rowWidth, Math.Max(label.Font.Height, measured.Height) + 2);
+                        int labelHeight = Math.Max(label.Font.Height, measured.Height);
+                        if (safety > 0)
+                        {
+                            // GDI can wrap a wide OpenCode row while MeasureText reports one line.
+                            Size full = TextRenderer.MeasureText(label.Text, label.Font,
+                                new Size(Int32.MaxValue, Int32.MaxValue), TextFormatFlags.NoPrefix);
+                            int lines = Math.Max(1, (int)Math.Ceiling((full.Width + safety) / (double)rowWidth));
+                            labelHeight = Math.Max(labelHeight, lines * label.Font.Height);
+                        }
+                        label.Bounds = new Rectangle(padding, rowY, rowWidth, labelHeight + 2);
                         rowY = label.Bottom + (int)label.Tag * dpi / 96;
                     }
                     rowY += padding;
@@ -861,6 +975,12 @@ namespace AIUsageTray
             {
                 changed |= SetText(fiveCountdown, UiText.T("До сброса: ", "Time to reset: ") + Countdown(snapshot.FiveHour.ResetUtc, now));
                 changed |= SetText(weekCountdown, UiText.T("До сброса: ", "Time to reset: ") + Countdown(snapshot.Weekly.ResetUtc, now));
+                if (quotaCountdown != null)
+                {
+                    ZenQuotaReport quota = snapshot.ZenQuota;
+                    DateTimeOffset? reset = quota != null && quota.HasData ? quota.ResetUtc : null;
+                    changed |= SetText(quotaCountdown, UiText.T("До сброса: ", "Time to reset: ") + Countdown(reset, now));
+                }
             }
             changed |= SetText(status, StatusText(provider, providerStatus, snapshot, error, now));
             if (changed && resize && Visible) FitToText(Screen.FromControl(this).WorkingArea);
