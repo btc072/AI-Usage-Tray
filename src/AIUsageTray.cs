@@ -849,7 +849,7 @@ namespace AIUsageTray
             string cost = snapshot != null && snapshot.TodayCost.HasValue ?
                 TrayIconRenderer.FormatCost(snapshot.TodayCost) : noData;
             Add(UiText.T("Токены за сегодня (UTC): ", "Tokens today (UTC): ") + tokens, 10);
-            Add(UiText.T("Стоимость за сегодня (оценка): ", "Cost today (estimated): ") + cost, 2);
+            Add(UiText.T("Стоимость за сегодня (оценка, UTC): ", "Cost today (estimated, UTC): ") + cost, 2);
         }
 
         private static string ReliabilityText(ZenQuotaReport quota, bool hasData)
