@@ -1,15 +1,16 @@
-# AI Usage Tray
+﻿# AI Usage Tray
 
 [English](README.md) | [Русский](README.ru.md)
 
-A compact Windows tray utility that shows your remaining Codex and Claude limits and your OpenCode token and cost usage for today. Each launch adds its own tray icon, and you choose the provider from the tray menu. Hover over an icon to see more details.
+A compact Windows tray utility that shows your remaining Codex and Claude limits and the OpenCode Zen free-tier quota estimate for the current UTC day. Each launch adds its own tray icon, and you choose the provider from the tray menu. Hover over an icon to see more details.
 
 Run the utility from a single file, <code>AIUsageTray.exe</code>. It uses the clients you already have installed and signed in.
 
 ## Features
 
-- Two rows on each icon. For Codex and Claude the five-hour limit is on top and the weekly limit is below; for OpenCode tokens today are on top and the estimated cost is below.
-- For Codex and Claude, each row has its own color based on the remaining limit. The OpenCode rows are usage, not limits, and stay neutral.
+- Codex and Claude icons have two rows: the five-hour limit on top and the weekly limit below. The OpenCode icon is a permanent monochrome mark with no digits; the quota is shown in the card.
+- The OpenCode card shows the free Zen quota estimate: used and remaining requests, percent, range, reset, confidence, exhaustion, and models with tokens. Today's tokens and estimated cost are secondary UTC-day rows.
+- For Codex and Claude, each row has its own color based on the remaining limit. The OpenCode card rows are usage and estimates, not limits, and stay neutral.
 - The plan in the card title, <code>&lt;Provider&gt; · PLAN</code>, is shown in uppercase and bold.
 - Manual provider selection from the tray menu: detected providers are bright and selectable, undetected providers are gray.
 - The card opens after 500 ms of continuous hovering; moving the pointer away before it appears cancels the opening.
@@ -71,11 +72,11 @@ For Codex and Claude the icon shows the **remaining** limit, and each row gets i
 | 10% or less | Red |
 | No reliable data | Gray dash |
 
-For OpenCode the icon shows tokens today on top and estimated cost below, in neutral colors (not the limit scale). The icon has a transparent background and opaque digits. An unknown value is shown as a dash, never as zero.
+For OpenCode the icon is a permanent monochrome mark with no digits, so it does not change when the quota, errors, or exhaustion change. The mark is a stylized provider sign: an outer square and a filled inner square. It adapts to the theme: dark in the light theme and light in the dark theme. The icon has a transparent background and an opaque mark. The card shows the quota details; an unknown value is shown as "not available", never as zero.
 
 ## Card
 
-All rows are centered. Percentage rows are bold. The window width fits the text. The right edge and taskbar each have a 6-pixel gap. The card has no title bar or system buttons. Dates use the Windows time zone.
+All rows are centered. Percentage rows are bold. The window width fits the text. The right edge and taskbar each have a 6-pixel gap. The card has no title bar or system buttons. Dates use the Windows time zone. A reset row ends with `(UTC)` or `(Retry-After)` to show which source selected the reset.
 
 The title is <code>&lt;Provider&gt; · PLAN</code>, with the plan in uppercase and bold. Without a plan, only the provider name is shown (for example, <code>Claude</code> or <code>OpenCode</code>).
 
@@ -125,9 +126,23 @@ Claude shows the same limit rows with its own plan name.
 
 ~~~text
 OpenCode
+Connection: local database (opencode db)
 
-Tokens today - 1,234,567
-Cost today (estimated) - $12.34
+Zen free quota (estimate, UTC)
+Used: 42 of ~200 requests
+Remaining: ~158 (79%)
+Range: 158–358
+Exhaustion expected: 22.10.2026 08:00
+Time to reset: 5 h 12 min
+Reset: 22.10.2026 10:00 (UTC)
+Confidence: medium
+Exhaustion: not detected
+
+Models:
+Model: deepseek-v4.1-flash-free — 30 observations; tokens 123,456; exhaustion: no
+
+Tokens today (UTC): 1,234,567
+Cost today (estimated, UTC): $12.34
 
 OpenCode is not running; data from the local database
 ~~~
@@ -149,7 +164,7 @@ Every 60 seconds the utility reads the selected provider. It creates no files of
 
 - **Codex** — starts a hidden child process, <code>codex app-server --listen stdio://</code>, and reads the limits with <code>account/rateLimits/read</code> (plan name with <code>account/read</code> when needed). Each request has a 15-second timeout and the process exits afterwards; requests do not overlap. It sends no model requests and uses no manual limit resets. Subscription metadata is read locally from Codex's saved authentication data.
 - **Claude** — reads the limits through the OAuth usage endpoint that Claude Code uses, with the saved Claude Code token first and the Claude Desktop token as a fallback. The endpoint is unofficial and may change. Without a usable saved token the live limits cannot be shown.
-- **OpenCode** — reads the local database through the official <code>opencode db</code> CLI (no network) and shows tokens and estimated cost for today. The cost is an estimate and can differ from the service's billing; it is not a limit.
+- **OpenCode** — reads the local database through the official <code>opencode db</code> CLI (no network) and estimates the free Zen quota for the current UTC day from local observations. There is no official Zen limits API. The card shows the quota estimate, remaining, percent, range, reset, confidence, exhaustion and models; tokens and estimated cost are secondary UTC-day rows. The cost is an estimate and can differ from the service's billing; it is not a limit.
 
 The utility reads credentials in memory only and never copies or stores tokens. If a request fails, the last successful result stays visible. A warning appears after a failure or when the data is at least 120 seconds old. The countdown updates only while the card is open.
 
@@ -178,3 +193,11 @@ The main source file is <a href="src/AIUsageTray.cs">src/AIUsageTray.cs</a>.
 ## Third-party code
 
 Some techniques are adapted from <a href="https://github.com/Tooblippe/codex-usage">Tooblippe/codex-usage</a> and <a href="https://github.com/VictorZakharov/codex-usage">VictorZakharov/codex-usage</a>. Their MIT notices are preserved in <a href="THIRD-PARTY-NOTICES.txt">THIRD-PARTY-NOTICES.txt</a> and embedded in the EXE. The source and versions of the adapted parts are listed in that file.
+
+The OpenCode Zen free-tier quota estimator adapts ideas and algorithms from <a href="https://github.com/thelabcorner/opencode-zen-fut-api">thelabcorner/opencode-zen-fut-api</a> (MIT, Copyright (c) 2026 TheLabCorner, commit <code>fda6dddd138ad382849e1a2b76c608db231d9942</code>). The adapted ideas include observation-based estimation, the UTC window, range and confidence, Retry-After calibration, exhaustion forecast, and model grouping. Its Node.js, Cloudflare Worker, CLI and SQLite reader are not used; the calculation is reimplemented natively in C#. The MIT notice is preserved in <a href="THIRD-PARTY-NOTICES.txt">THIRD-PARTY-NOTICES.txt</a>.
+
+The OpenCode name and mark are used only to identify the provider; this project is not affiliated with OpenCode.
+
+The pinned commits for the adapted projects are recorded in <code>docs/reference-projects.md</code>. That file is local and ignored by Git; it is not part of the repository and is not shipped in the release.
+
+
