@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -163,7 +164,21 @@ internal static class RegressionTests
     private static int[] Pids()
     {
         if (!File.Exists(pidFile)) return new int[0];
-        try { return Array.ConvertAll(File.ReadAllLines(pidFile), Int32.Parse); }
+        try
+        {
+            List<int> ids = new List<int>();
+            using (FileStream stream = new FileStream(pidFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (StreamReader reader = new StreamReader(stream))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    int id;
+                    if (Int32.TryParse(line, out id)) ids.Add(id);
+                }
+            }
+            return ids.ToArray();
+        }
         catch (IOException) { return new int[0]; }
     }
     private static bool Alive(int id)
