@@ -327,14 +327,14 @@ namespace AIUsageTray
     internal sealed class CodexReader : IDisposable
     {
         private readonly object processLock = new object();
-        private Process owned;
+        private OwnedProcess owned;
         private bool disposed;
         private bool cleanupFailed;
         private int reading;
         internal ReadMetrics LastMetrics { get; private set; }
         internal int OwnedProcessId
         {
-            get { lock (processLock) { return owned == null ? 0 : owned.Id; } }
+            get { lock (processLock) { return owned == null ? 0 : owned.Process.Id; } }
         }
         internal Task<UsageSnapshot> ReadAsync(CancellationToken stop)
         {
@@ -359,6 +359,7 @@ namespace AIUsageTray
         {
             bool readSavedMetadata = launch == null;
             Process process = null;
+            OwnedProcess session = null;
             Task errors = null;
             CancellationTokenRegistration cancel = new CancellationTokenRegistration();
             ReadMetrics metrics = new ReadMetrics();
@@ -368,35 +369,36 @@ namespace AIUsageTray
             {
                 if (launch == null) launch = CodexLocator.Hidden(CodexLocator.Find(deadline), "app-server --listen stdio://");
                 deadline.ThrowIfCancellationRequested();
-                process = new Process { StartInfo = launch };
                 lock (processLock)
                 {
                     if (disposed) throw new OperationCanceledException(stop);
                     if (cleanupFailed) throw new UsageReadException(UiText.T("Предыдущий процесс Codex не завершён", "The previous Codex process has not exited"));
-                    process.Start();
-                    owned = process;
+                    session = OwnedProcess.Start(launch, deadline);
+                    process = session.Process;
+                    owned = session;
                     metrics.ProcessId = process.Id;
                 }
                 cancel = deadline.Register(KillOwned);
                 deadline.ThrowIfCancellationRequested();
                 errors = Task.Run(delegate {
-                    try { char[] buffer = new char[4096]; while (process.StandardError.Read(buffer, 0, buffer.Length) != 0) { } }
+                    try { char[] buffer = new char[4096]; while (session.StandardError.Read(buffer, 0, buffer.Length) != 0) { } }
+                    catch (OperationCanceledException) { }
                     catch (IOException) { }
                     catch (ObjectDisposedException) { }
                     catch (InvalidOperationException) { }
                 });
-                Send(process, "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"ai-usage-tray\",\"version\":\"2.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}");
-                Response(process, 1, deadline);
-                Send(process, "{\"method\":\"initialized\",\"params\":null}");
-                Send(process, "{\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":null}");
-                UsageSnapshot snapshot = UsageParser.Parse(Response(process, 2, deadline), DateTimeOffset.UtcNow);
+                Send(session, "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"ai-usage-tray\",\"version\":\"2.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}");
+                Response(session, 1, deadline);
+                Send(session, "{\"method\":\"initialized\",\"params\":null}");
+                Send(session, "{\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":null}");
+                UsageSnapshot snapshot = UsageParser.Parse(Response(session, 2, deadline), DateTimeOffset.UtcNow);
                 metrics.ResponseMilliseconds = elapsed.Elapsed.TotalMilliseconds;
                 if (String.IsNullOrEmpty(snapshot.PlanType))
                 {
                     try
                     {
-                        Send(process, "{\"id\":3,\"method\":\"account/read\",\"params\":null}");
-                        Dictionary<string, object> account = UsageParser.Map(UsageParser.Field(UsageParser.Json(Response(process, 3, deadline)), "result"));
+                        Send(session, "{\"id\":3,\"method\":\"account/read\",\"params\":null}");
+                        Dictionary<string, object> account = UsageParser.Map(UsageParser.Field(UsageParser.Json(Response(session, 3, deadline)), "result"));
                         snapshot.PlanType = UsageParser.Text(UsageParser.Field(UsageParser.Map(UsageParser.Field(account, "account")), "planType")) ??
                             UsageParser.Text(UsageParser.Field(account, "planType"));
                     }
@@ -435,8 +437,8 @@ namespace AIUsageTray
                     Stopwatch cleanup = Stopwatch.StartNew();
                     try
                     {
-                        try { process.StandardInput.Close(); } catch (IOException) { } catch (InvalidOperationException) { }
-                        if (!process.WaitForExit(500)) CodexLocator.Stop(process);
+                        try { session.StandardInput.Close(); } catch (IOException) { } catch (InvalidOperationException) { }
+                        if (!process.WaitForExit(500)) session.Stop();
                         metrics.Exited = process.HasExited;
                         if (errors != null) errors.Wait(500);
                     }
@@ -446,10 +448,10 @@ namespace AIUsageTray
                         metrics.CleanupMilliseconds = cleanup.Elapsed.TotalMilliseconds;
                         lock (processLock)
                         {
-                            if (owned == process) owned = null;
+                            if (owned == session) owned = null;
                             cleanupFailed = metrics.ProcessId != 0 && !metrics.Exited;
                         }
-                        process.Dispose();
+                        session.Dispose();
                     }
                     if (cleanupFailed) throw new UsageReadException(UiText.T("Не удалось завершить собственный процесс Codex", "Unable to stop the owned Codex process"));
                 }
@@ -467,12 +469,12 @@ namespace AIUsageTray
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
         }
-        private static void Send(Process process, string line)
+        private static void Send(OwnedProcess process, string line)
         {
             process.StandardInput.WriteLine(line);
             process.StandardInput.Flush();
         }
-        private static string Response(Process process, int id, CancellationToken cancel)
+        private static string Response(OwnedProcess process, int id, CancellationToken cancel)
         {
             while (true)
             {
@@ -511,7 +513,7 @@ namespace AIUsageTray
         }
         private void KillOwned()
         {
-            lock (processLock) { if (owned != null) CodexLocator.Stop(owned); }
+            lock (processLock) { if (owned != null) owned.Stop(); }
         }
         public void Dispose()
         {
@@ -1542,8 +1544,7 @@ namespace AIUsageTray
         {
             double? used = UsageParser.Number(utilization);
             if (!used.HasValue) return null;
-            double percent = used.Value <= 1d ? used.Value * 100d : used.Value;
-            return RemainingFromPercent(percent);
+            return RemainingFromPercent(used.Value);
         }
         internal static double? GetRemainingPercent(object percentValue)
         {
@@ -1849,13 +1850,13 @@ namespace AIUsageTray
     internal sealed class OpenCodeReader : IDisposable
     {
         private readonly object processLock = new object();
-        private Process owned;
+        private OwnedProcess owned;
         private bool disposed;
         private bool cleanupFailed;
         private int reading;
         internal int OwnedProcessId
         {
-            get { lock (processLock) { return owned == null ? 0 : owned.Id; } }
+            get { lock (processLock) { return owned == null ? 0 : owned.Process.Id; } }
         }
         internal static long StartOfTodayMilliseconds()
         {
@@ -1892,6 +1893,7 @@ namespace AIUsageTray
                 throw new UsageReadException(UiText.T("Локальная база OpenCode не найдена", "The local OpenCode database was not found"));
             string sql = Query(StartOfTodayMilliseconds());
             Process process = null;
+            OwnedProcess session = null;
             Task errors = null;
             CancellationTokenRegistration cancel = new CancellationTokenRegistration();
             try
@@ -1899,23 +1901,24 @@ namespace AIUsageTray
                 deadline.ThrowIfCancellationRequested();
                 ProcessStartInfo launch = CodexLocator.Hidden(OpenCodeLocator.Find(deadline),
                     "db \"" + sql + "\" --format json --pure");
-                process = new Process { StartInfo = launch };
                 lock (processLock)
                 {
                     if (disposed) throw new OperationCanceledException(stop);
                     if (cleanupFailed) throw new UsageReadException(UiText.T("Предыдущий процесс OpenCode не завершён", "The previous OpenCode process has not exited"));
-                    process.Start();
-                    owned = process;
+                    session = OwnedProcess.Start(launch, deadline);
+                    process = session.Process;
+                    owned = session;
                 }
                 cancel = deadline.Register(KillOwned);
                 deadline.ThrowIfCancellationRequested();
                 errors = Task.Run(delegate {
-                    try { char[] buffer = new char[4096]; while (process.StandardError.Read(buffer, 0, buffer.Length) != 0) { } }
+                    try { char[] buffer = new char[4096]; while (session.StandardError.Read(buffer, 0, buffer.Length) != 0) { } }
+                    catch (OperationCanceledException) { }
                     catch (IOException) { }
                     catch (ObjectDisposedException) { }
                     catch (InvalidOperationException) { }
                 });
-                string output = ReadOutput(process, deadline);
+                string output = ReadOutput(session, deadline);
                 if (!process.WaitForExit(3000))
                     throw new UsageReadException(UiText.T("OpenCode CLI не завершился", "The OpenCode CLI did not exit"));
                 deadline.ThrowIfCancellationRequested();
@@ -1950,8 +1953,8 @@ namespace AIUsageTray
                     bool stopped = true;
                     try
                     {
-                        try { process.StandardInput.Close(); } catch (IOException) { } catch (InvalidOperationException) { }
-                        if (!process.WaitForExit(500)) CodexLocator.Stop(process);
+                        try { session.StandardInput.Close(); } catch (IOException) { } catch (InvalidOperationException) { }
+                        if (!process.WaitForExit(500)) session.Stop();
                         stopped = process.HasExited;
                         if (errors != null) errors.Wait(500);
                     }
@@ -1960,17 +1963,17 @@ namespace AIUsageTray
                     {
                         lock (processLock)
                         {
-                            if (owned == process) owned = null;
+                            if (owned == session) owned = null;
                             cleanupFailed = !stopped;
                         }
-                        process.Dispose();
+                        session.Dispose();
                     }
                     if (cleanupFailed)
                         throw new UsageReadException(UiText.T("Не удалось завершить собственный процесс OpenCode", "Unable to stop the owned OpenCode process"));
                 }
             }
         }
-        private static string ReadOutput(Process process, CancellationToken deadline)
+        private static string ReadOutput(OwnedProcess process, CancellationToken deadline)
         {
             StringBuilder body = new StringBuilder();
             char[] buffer = new char[4096];
@@ -1988,7 +1991,7 @@ namespace AIUsageTray
         }
         private void KillOwned()
         {
-            lock (processLock) { if (owned != null) CodexLocator.Stop(owned); }
+            lock (processLock) { if (owned != null) owned.Stop(); }
         }
         public void Dispose()
         {
