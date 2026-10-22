@@ -1,3 +1,5 @@
+param([switch]$Tests)
+
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = [IO.Path]::GetFullPath($PSScriptRoot)
@@ -35,5 +37,7 @@ $common = @(
 if ($LASTEXITCODE -ne 0) { throw "Product build failed with exit code $LASTEXITCODE" }
 
 Write-Host 'PASS: local build'
-
-
+if ($Tests) {
+    & (Join-Path $projectRoot 'tests\T7\Run-T7.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'T7 tests failed' }
+}

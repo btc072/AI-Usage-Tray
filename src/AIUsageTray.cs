@@ -56,6 +56,12 @@ namespace AIUsageTray
         internal DateTimeOffset? ActiveUntilUtc { get; set; }
         internal DateTimeOffset? LastCheckedUtc { get; set; }
     }
+    internal static class AppLimits
+    {
+        internal const int RefreshMilliseconds = 60000;
+        internal const int ReadTimeoutMilliseconds = 15000;
+        internal const int ExitGraceMilliseconds = 3000;
+    }
     internal sealed class UsageSnapshot
     {
         internal UsageWindow FiveHour { get; set; }
@@ -310,9 +316,53 @@ namespace AIUsageTray
         }
         internal static void Stop(Process process)
         {
-            try { if (!process.HasExited) { process.Kill(); process.WaitForExit(1000); } }
+            try
+            {
+                if (process.HasExited) return;
+                TryTreeKill(process);
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        process.Kill();
+                        process.WaitForExit(1000);
+                    }
+                }
+                catch (InvalidOperationException) { }
+                catch (System.ComponentModel.Win32Exception) { }
+            }
+            catch (ObjectDisposedException) { }
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
+            catch (IOException) { }
+            catch (NotSupportedException) { }
+        }
+        private static void TryTreeKill(Process process)
+        {
+            try
+            {
+                string taskkill = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.System), "taskkill.exe");
+                if (!File.Exists(taskkill)) return;
+                ProcessStartInfo start = new ProcessStartInfo(taskkill, "/PID " + process.Id + " /T /F");
+                start.UseShellExecute = false;
+                start.CreateNoWindow = true;
+                using (Process killer = Process.Start(start))
+                {
+                    if (killer == null) return;
+                    if (!killer.WaitForExit(2000))
+                    {
+                        try { killer.Kill(); }
+                        catch (InvalidOperationException) { }
+                        catch (System.ComponentModel.Win32Exception) { }
+                    }
+                }
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            catch (IOException) { }
+            catch (NotSupportedException) { }
         }
         internal static void ClearCache() { cached = null; }
     }
@@ -340,7 +390,7 @@ namespace AIUsageTray
         }
         internal Task<UsageSnapshot> ReadAsync(CancellationToken stop)
         {
-            return ReadAsync(null, stop, 15000);
+            return ReadAsync(null, stop, AppLimits.ReadTimeoutMilliseconds);
         }
         internal async Task<UsageSnapshot> ReadAsync(ProcessStartInfo testLaunch, CancellationToken stop, int timeoutMilliseconds)
         {
@@ -1197,7 +1247,7 @@ namespace AIUsageTray
                 if (!hoverAnchor.Contains(Cursor.Position) || menu.Visible) { open.Stop(); return; }
                 open.Stop(); Popup.ShowCard(hoverAnchor, false);
             };
-            poll.Tick += async delegate { poll.Interval = 60000; await Refresh(); };
+            poll.Tick += async delegate { poll.Interval = AppLimits.RefreshMilliseconds; await Refresh(); };
             DrawIcon();
             if (Tray.Registered) DrawIcon(); // Recalculate against the registered icon's monitor.
             if (startPolling) poll.Start();
@@ -1255,7 +1305,7 @@ namespace AIUsageTray
             IUsageProvider source = provider;
             try
             {
-                UsageSnapshot result = await source.ReadAsync(stop.Token, 15000);
+                UsageSnapshot result = await source.ReadAsync(stop.Token, AppLimits.ReadTimeoutMilliseconds);
                 if (!exiting && current == generation) { snapshot = result; error = null; }
             }
             catch (OperationCanceledException) { }
@@ -1945,13 +1995,51 @@ namespace AIUsageTray
         }
         internal static void ClearCache() { cached = null; }
     }
+    internal sealed class ProcessJob : IDisposable
+    {
+        private IntPtr handle;
+        private ProcessJob(IntPtr handle) { this.handle = handle; }
+        internal static ProcessJob TryCreate(Process process)
+        {
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                handle = Native.CreateJobObject(IntPtr.Zero, null);
+                if (handle == IntPtr.Zero) return null;
+                if (!Native.SetJobKillOnClose(handle) || !Native.AssignProcessToJobObject(handle, process.Handle))
+                {
+                    Native.CloseHandle(handle);
+                    return null;
+                }
+                return new ProcessJob(handle);
+            }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            catch (NotSupportedException) { }
+            if (handle != IntPtr.Zero) Native.CloseHandle(handle);
+            return null;
+        }
+        public void Dispose()
+        {
+            if (handle == IntPtr.Zero) return;
+            Native.CloseHandle(handle);
+            handle = IntPtr.Zero;
+        }
+    }
     internal sealed class OpenCodeReader : IDisposable
     {
         private readonly object processLock = new object();
         private Process owned;
+        private ProcessJob job;
         private bool disposed;
         private bool cleanupFailed;
         private int reading;
+        private readonly Func<DateTimeOffset> clock;
+        internal OpenCodeReader() : this(null) { }
+        internal OpenCodeReader(Func<DateTimeOffset> clock)
+        {
+            this.clock = clock ?? delegate { return DateTimeOffset.UtcNow; };
+        }
         internal int OwnedProcessId
         {
             get { lock (processLock) { return owned == null ? 0 : owned.Id; } }
@@ -1965,17 +2053,22 @@ namespace AIUsageTray
                 using (CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(stop))
                 {
                     deadline.CancelAfter(timeoutMilliseconds);
-                    return await Task.Run(delegate { return Read(deadline.Token, stop); }).ConfigureAwait(false);
+                    return await Task.Run(delegate { return Read(deadline.Token, stop, timeoutMilliseconds); }).ConfigureAwait(false);
                 }
             }
             finally { Interlocked.Exchange(ref reading, 0); }
         }
-        private UsageSnapshot Read(CancellationToken deadline, CancellationToken stop)
+        private static string TimeoutMessage(int timeoutMilliseconds)
+        {
+            int seconds = Math.Max(1, timeoutMilliseconds / 1000);
+            return UiText.T("OpenCode не ответил за " + seconds + " с", "OpenCode did not respond within " + seconds + " seconds");
+        }
+        private UsageSnapshot Read(CancellationToken deadline, CancellationToken stop, int timeoutMilliseconds)
         {
             string database = OpenCodeFiles.DatabasePath();
             if (String.IsNullOrEmpty(database) || !File.Exists(database))
                 throw new UsageReadException(UiText.T("Локальная база OpenCode не найдена", "The local OpenCode database was not found"));
-            DateTimeOffset now = DateTimeOffset.UtcNow;
+            DateTimeOffset now = clock();
             long start = OpenCodeUsageParser.StartOfUtcDay(now);
             string sql = OpenCodeUsageParser.Query(start, start + OpenCodeUsageParser.DayMilliseconds);
             Process process = null;
@@ -1993,6 +2086,7 @@ namespace AIUsageTray
                     if (cleanupFailed) throw new UsageReadException(UiText.T("Предыдущий процесс OpenCode не завершён", "The previous OpenCode process has not exited"));
                     process.Start();
                     owned = process;
+                    job = ProcessJob.TryCreate(process);
                 }
                 cancel = deadline.Register(KillOwned);
                 deadline.ThrowIfCancellationRequested();
@@ -2003,7 +2097,7 @@ namespace AIUsageTray
                     catch (InvalidOperationException) { }
                 });
                 string output = ReadOutput(process, deadline);
-                if (!process.WaitForExit(3000))
+                if (!process.WaitForExit(AppLimits.ExitGraceMilliseconds))
                     throw new UsageReadException(UiText.T("OpenCode CLI не завершился", "The OpenCode CLI did not exit"));
                 deadline.ThrowIfCancellationRequested();
                 stop.ThrowIfCancellationRequested();
@@ -2049,6 +2143,7 @@ namespace AIUsageTray
                         lock (processLock)
                         {
                             if (owned == process) owned = null;
+                            if (job != null) { job.Dispose(); job = null; }
                             cleanupFailed = !stopped;
                         }
                         process.Dispose();
@@ -2065,7 +2160,19 @@ namespace AIUsageTray
             while (true)
             {
                 deadline.ThrowIfCancellationRequested();
-                int count = process.StandardOutput.Read(buffer, 0, buffer.Length);
+                Task<int> pending = process.StandardOutput.ReadAsync(buffer, 0, buffer.Length);
+                while (!pending.IsCompleted)
+                {
+                    if (deadline.IsCancellationRequested)
+                    {
+                        try { process.StandardOutput.Dispose(); }
+                        catch (ObjectDisposedException) { }
+                        catch (InvalidOperationException) { }
+                        deadline.ThrowIfCancellationRequested();
+                    }
+                    Thread.Sleep(10);
+                }
+                int count = pending.GetAwaiter().GetResult();
                 deadline.ThrowIfCancellationRequested();
                 if (count <= 0) break;
                 if (body.Length + count > UsageParser.MaxJsonLength)
@@ -2076,7 +2183,11 @@ namespace AIUsageTray
         }
         private void KillOwned()
         {
-            lock (processLock) { if (owned != null) CodexLocator.Stop(owned); }
+            lock (processLock)
+            {
+                if (job != null) { job.Dispose(); job = null; }
+                if (owned != null) CodexLocator.Stop(owned);
+            }
         }
         public void Dispose()
         {
@@ -2270,5 +2381,52 @@ namespace AIUsageTray
         }
         [StructLayout(LayoutKind.Sequential)]
         internal struct Rect { internal int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct JobBasicLimits
+        {
+            internal long PerProcessUserTimeLimit;
+            internal long PerJobUserTimeLimit;
+            internal uint LimitFlags;
+            internal UIntPtr MinimumWorkingSetSize;
+            internal UIntPtr MaximumWorkingSetSize;
+            internal uint ActiveProcessLimit;
+            internal UIntPtr Affinity;
+            internal uint PriorityClass;
+            internal uint SchedulingClass;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct JobIoCounters
+        {
+            internal ulong ReadOperationCount;
+            internal ulong WriteOperationCount;
+            internal ulong OtherOperationCount;
+            internal ulong ReadTransferCount;
+            internal ulong WriteTransferCount;
+            internal ulong OtherTransferCount;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct JobExtendedLimits
+        {
+            internal JobBasicLimits BasicLimitInformation;
+            internal JobIoCounters IoInfo;
+            internal UIntPtr ProcessMemoryLimit;
+            internal UIntPtr JobMemoryLimit;
+            internal UIntPtr PeakProcessMemoryUsed;
+            internal UIntPtr PeakJobMemoryUsed;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JobExtendedLimits info, uint length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool CloseHandle(IntPtr handle);
+        internal static bool SetJobKillOnClose(IntPtr job)
+        {
+            JobExtendedLimits info = new JobExtendedLimits();
+            info.BasicLimitInformation.LimitFlags = 0x2000;
+            return SetInformationJobObject(job, 9, ref info, (uint)Marshal.SizeOf(typeof(JobExtendedLimits)));
+        }
     }
 }
