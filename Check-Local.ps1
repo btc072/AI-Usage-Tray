@@ -2,11 +2,11 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-$source = Join-Path $projectRoot 'src\AIUsageTray.cs'
+$source = @(Get-ChildItem -LiteralPath (Join-Path $projectRoot 'src') -Filter '*.cs' -File | Sort-Object Name | ForEach-Object { $_.FullName })
 $notices = Join-Path $projectRoot 'THIRD-PARTY-NOTICES.txt'
 $distDir = [IO.Path]::GetFullPath((Join-Path $projectRoot 'dist'))
 
-foreach ($file in @($compiler, $source, $notices)) {
+foreach ($file in @($compiler, $notices) + $source) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
         throw "Required file not found: $file"
     }
