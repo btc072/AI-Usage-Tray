@@ -316,53 +316,9 @@ namespace AIUsageTray
         }
         internal static void Stop(Process process)
         {
-            try
-            {
-                if (process.HasExited) return;
-                TryTreeKill(process);
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        process.Kill();
-                        process.WaitForExit(1000);
-                    }
-                }
-                catch (InvalidOperationException) { }
-                catch (System.ComponentModel.Win32Exception) { }
-            }
-            catch (ObjectDisposedException) { }
+            try { if (!process.HasExited) { process.Kill(); process.WaitForExit(1000); } }
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
-            catch (IOException) { }
-            catch (NotSupportedException) { }
-        }
-        private static void TryTreeKill(Process process)
-        {
-            try
-            {
-                string taskkill = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.System), "taskkill.exe");
-                if (!File.Exists(taskkill)) return;
-                ProcessStartInfo start = new ProcessStartInfo(taskkill, "/PID " + process.Id + " /T /F");
-                start.UseShellExecute = false;
-                start.CreateNoWindow = true;
-                using (Process killer = Process.Start(start))
-                {
-                    if (killer == null) return;
-                    if (!killer.WaitForExit(2000))
-                    {
-                        try { killer.Kill(); }
-                        catch (InvalidOperationException) { }
-                        catch (System.ComponentModel.Win32Exception) { }
-                    }
-                }
-            }
-            catch (ObjectDisposedException) { }
-            catch (InvalidOperationException) { }
-            catch (System.ComponentModel.Win32Exception) { }
-            catch (IOException) { }
-            catch (NotSupportedException) { }
         }
         internal static void ClearCache() { cached = null; }
     }
@@ -379,14 +335,14 @@ namespace AIUsageTray
     internal sealed class CodexReader : IDisposable
     {
         private readonly object processLock = new object();
-        private Process owned;
+        private OwnedProcess owned;
         private bool disposed;
         private bool cleanupFailed;
         private int reading;
         internal ReadMetrics LastMetrics { get; private set; }
         internal int OwnedProcessId
         {
-            get { lock (processLock) { return owned == null ? 0 : owned.Id; } }
+            get { lock (processLock) { return owned == null ? 0 : owned.Process.Id; } }
         }
         internal Task<UsageSnapshot> ReadAsync(CancellationToken stop)
         {
@@ -411,6 +367,7 @@ namespace AIUsageTray
         {
             bool readSavedMetadata = launch == null;
             Process process = null;
+            OwnedProcess session = null;
             Task errors = null;
             CancellationTokenRegistration cancel = new CancellationTokenRegistration();
             ReadMetrics metrics = new ReadMetrics();
@@ -420,35 +377,36 @@ namespace AIUsageTray
             {
                 if (launch == null) launch = CodexLocator.Hidden(CodexLocator.Find(deadline), "app-server --listen stdio://");
                 deadline.ThrowIfCancellationRequested();
-                process = new Process { StartInfo = launch };
                 lock (processLock)
                 {
                     if (disposed) throw new OperationCanceledException(stop);
                     if (cleanupFailed) throw new UsageReadException(UiText.T("Предыдущий процесс Codex не завершён", "The previous Codex process has not exited"));
-                    process.Start();
-                    owned = process;
+                    session = OwnedProcess.Start(launch, deadline);
+                    process = session.Process;
+                    owned = session;
                     metrics.ProcessId = process.Id;
                 }
                 cancel = deadline.Register(KillOwned);
                 deadline.ThrowIfCancellationRequested();
                 errors = Task.Run(delegate {
-                    try { char[] buffer = new char[4096]; while (process.StandardError.Read(buffer, 0, buffer.Length) != 0) { } }
+                    try { char[] buffer = new char[4096]; while (session.StandardError.Read(buffer, 0, buffer.Length) != 0) { } }
+                    catch (OperationCanceledException) { }
                     catch (IOException) { }
                     catch (ObjectDisposedException) { }
                     catch (InvalidOperationException) { }
                 });
-                Send(process, "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"ai-usage-tray\",\"version\":\"2.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}");
-                Response(process, 1, deadline);
-                Send(process, "{\"method\":\"initialized\",\"params\":null}");
-                Send(process, "{\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":null}");
-                UsageSnapshot snapshot = UsageParser.Parse(Response(process, 2, deadline), DateTimeOffset.UtcNow);
+                Send(session, "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"ai-usage-tray\",\"version\":\"2.0.0\"},\"capabilities\":{\"experimentalApi\":true}}}");
+                Response(session, 1, deadline);
+                Send(session, "{\"method\":\"initialized\",\"params\":null}");
+                Send(session, "{\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":null}");
+                UsageSnapshot snapshot = UsageParser.Parse(Response(session, 2, deadline), DateTimeOffset.UtcNow);
                 metrics.ResponseMilliseconds = elapsed.Elapsed.TotalMilliseconds;
                 if (String.IsNullOrEmpty(snapshot.PlanType))
                 {
                     try
                     {
-                        Send(process, "{\"id\":3,\"method\":\"account/read\",\"params\":null}");
-                        Dictionary<string, object> account = UsageParser.Map(UsageParser.Field(UsageParser.Json(Response(process, 3, deadline)), "result"));
+                        Send(session, "{\"id\":3,\"method\":\"account/read\",\"params\":null}");
+                        Dictionary<string, object> account = UsageParser.Map(UsageParser.Field(UsageParser.Json(Response(session, 3, deadline)), "result"));
                         snapshot.PlanType = UsageParser.Text(UsageParser.Field(UsageParser.Map(UsageParser.Field(account, "account")), "planType")) ??
                             UsageParser.Text(UsageParser.Field(account, "planType"));
                     }
@@ -487,8 +445,8 @@ namespace AIUsageTray
                     Stopwatch cleanup = Stopwatch.StartNew();
                     try
                     {
-                        try { process.StandardInput.Close(); } catch (IOException) { } catch (InvalidOperationException) { }
-                        if (!process.WaitForExit(500)) CodexLocator.Stop(process);
+                        try { session.StandardInput.Close(); } catch (IOException) { } catch (InvalidOperationException) { }
+                        if (!process.WaitForExit(500)) session.Stop();
                         metrics.Exited = process.HasExited;
                         if (errors != null) errors.Wait(500);
                     }
@@ -498,10 +456,10 @@ namespace AIUsageTray
                         metrics.CleanupMilliseconds = cleanup.Elapsed.TotalMilliseconds;
                         lock (processLock)
                         {
-                            if (owned == process) owned = null;
+                            if (owned == session) owned = null;
                             cleanupFailed = metrics.ProcessId != 0 && !metrics.Exited;
                         }
-                        process.Dispose();
+                        session.Dispose();
                     }
                     if (cleanupFailed) throw new UsageReadException(UiText.T("Не удалось завершить собственный процесс Codex", "Unable to stop the owned Codex process"));
                 }
@@ -519,12 +477,12 @@ namespace AIUsageTray
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
         }
-        private static void Send(Process process, string line)
+        private static void Send(OwnedProcess process, string line)
         {
             process.StandardInput.WriteLine(line);
             process.StandardInput.Flush();
         }
-        private static string Response(Process process, int id, CancellationToken cancel)
+        private static string Response(OwnedProcess process, int id, CancellationToken cancel)
         {
             while (true)
             {
@@ -563,7 +521,7 @@ namespace AIUsageTray
         }
         private void KillOwned()
         {
-            lock (processLock) { if (owned != null) CodexLocator.Stop(owned); }
+            lock (processLock) { if (owned != null) owned.Stop(); }
         }
         public void Dispose()
         {
@@ -1723,8 +1681,7 @@ namespace AIUsageTray
         {
             double? used = UsageParser.Number(utilization);
             if (!used.HasValue) return null;
-            double percent = used.Value <= 1d ? used.Value * 100d : used.Value;
-            return RemainingFromPercent(percent);
+            return RemainingFromPercent(used.Value);
         }
         internal static double? GetRemainingPercent(object percentValue)
         {
@@ -1995,42 +1952,10 @@ namespace AIUsageTray
         }
         internal static void ClearCache() { cached = null; }
     }
-    internal sealed class ProcessJob : IDisposable
-    {
-        private IntPtr handle;
-        private ProcessJob(IntPtr handle) { this.handle = handle; }
-        internal static ProcessJob TryCreate(Process process)
-        {
-            IntPtr handle = IntPtr.Zero;
-            try
-            {
-                handle = Native.CreateJobObject(IntPtr.Zero, null);
-                if (handle == IntPtr.Zero) return null;
-                if (!Native.SetJobKillOnClose(handle) || !Native.AssignProcessToJobObject(handle, process.Handle))
-                {
-                    Native.CloseHandle(handle);
-                    return null;
-                }
-                return new ProcessJob(handle);
-            }
-            catch (InvalidOperationException) { }
-            catch (System.ComponentModel.Win32Exception) { }
-            catch (NotSupportedException) { }
-            if (handle != IntPtr.Zero) Native.CloseHandle(handle);
-            return null;
-        }
-        public void Dispose()
-        {
-            if (handle == IntPtr.Zero) return;
-            Native.CloseHandle(handle);
-            handle = IntPtr.Zero;
-        }
-    }
     internal sealed class OpenCodeReader : IDisposable
     {
         private readonly object processLock = new object();
-        private Process owned;
-        private ProcessJob job;
+        private OwnedProcess owned;
         private bool disposed;
         private bool cleanupFailed;
         private int reading;
@@ -2042,7 +1967,7 @@ namespace AIUsageTray
         }
         internal int OwnedProcessId
         {
-            get { lock (processLock) { return owned == null ? 0 : owned.Id; } }
+            get { lock (processLock) { return owned == null ? 0 : owned.Process.Id; } }
         }
         internal async Task<UsageSnapshot> ReadAsync(CancellationToken stop, int timeoutMilliseconds)
         {
@@ -2072,6 +1997,7 @@ namespace AIUsageTray
             long start = OpenCodeUsageParser.StartOfUtcDay(now);
             string sql = OpenCodeUsageParser.Query(start, start + OpenCodeUsageParser.DayMilliseconds);
             Process process = null;
+            OwnedProcess session = null;
             Task errors = null;
             CancellationTokenRegistration cancel = new CancellationTokenRegistration();
             try
@@ -2079,24 +2005,24 @@ namespace AIUsageTray
                 deadline.ThrowIfCancellationRequested();
                 ProcessStartInfo launch = CodexLocator.Hidden(OpenCodeLocator.Find(deadline),
                     "db \"" + sql + "\" --format json --pure");
-                process = new Process { StartInfo = launch };
                 lock (processLock)
                 {
                     if (disposed) throw new OperationCanceledException(stop);
                     if (cleanupFailed) throw new UsageReadException(UiText.T("Предыдущий процесс OpenCode не завершён", "The previous OpenCode process has not exited"));
-                    process.Start();
-                    owned = process;
-                    job = ProcessJob.TryCreate(process);
+                    session = OwnedProcess.Start(launch, deadline);
+                    process = session.Process;
+                    owned = session;
                 }
                 cancel = deadline.Register(KillOwned);
                 deadline.ThrowIfCancellationRequested();
                 errors = Task.Run(delegate {
-                    try { char[] buffer = new char[4096]; while (process.StandardError.Read(buffer, 0, buffer.Length) != 0) { } }
+                    try { char[] buffer = new char[4096]; while (session.StandardError.Read(buffer, 0, buffer.Length) != 0) { } }
+                    catch (OperationCanceledException) { }
                     catch (IOException) { }
                     catch (ObjectDisposedException) { }
                     catch (InvalidOperationException) { }
                 });
-                string output = ReadOutput(process, deadline);
+                string output = ReadOutput(session, deadline);
                 if (!process.WaitForExit(AppLimits.ExitGraceMilliseconds))
                     throw new UsageReadException(UiText.T("OpenCode CLI не завершился", "The OpenCode CLI did not exit"));
                 deadline.ThrowIfCancellationRequested();
@@ -2132,8 +2058,8 @@ namespace AIUsageTray
                     bool stopped = true;
                     try
                     {
-                        try { process.StandardInput.Close(); } catch (IOException) { } catch (InvalidOperationException) { }
-                        if (!process.WaitForExit(500)) CodexLocator.Stop(process);
+                        try { session.StandardInput.Close(); } catch (IOException) { } catch (InvalidOperationException) { }
+                        if (!process.WaitForExit(500)) session.Stop();
                         stopped = process.HasExited;
                         if (errors != null) errors.Wait(500);
                     }
@@ -2142,37 +2068,24 @@ namespace AIUsageTray
                     {
                         lock (processLock)
                         {
-                            if (owned == process) owned = null;
-                            if (job != null) { job.Dispose(); job = null; }
+                            if (owned == session) owned = null;
                             cleanupFailed = !stopped;
                         }
-                        process.Dispose();
+                        session.Dispose();
                     }
                     if (cleanupFailed)
                         throw new UsageReadException(UiText.T("Не удалось завершить собственный процесс OpenCode", "Unable to stop the owned OpenCode process"));
                 }
             }
         }
-        private static string ReadOutput(Process process, CancellationToken deadline)
+        private static string ReadOutput(OwnedProcess process, CancellationToken deadline)
         {
             StringBuilder body = new StringBuilder();
             char[] buffer = new char[4096];
             while (true)
             {
                 deadline.ThrowIfCancellationRequested();
-                Task<int> pending = process.StandardOutput.ReadAsync(buffer, 0, buffer.Length);
-                while (!pending.IsCompleted)
-                {
-                    if (deadline.IsCancellationRequested)
-                    {
-                        try { process.StandardOutput.Dispose(); }
-                        catch (ObjectDisposedException) { }
-                        catch (InvalidOperationException) { }
-                        deadline.ThrowIfCancellationRequested();
-                    }
-                    Thread.Sleep(10);
-                }
-                int count = pending.GetAwaiter().GetResult();
+                int count = process.StandardOutput.Read(buffer, 0, buffer.Length);
                 deadline.ThrowIfCancellationRequested();
                 if (count <= 0) break;
                 if (body.Length + count > UsageParser.MaxJsonLength)
@@ -2183,11 +2096,7 @@ namespace AIUsageTray
         }
         private void KillOwned()
         {
-            lock (processLock)
-            {
-                if (job != null) { job.Dispose(); job = null; }
-                if (owned != null) CodexLocator.Stop(owned);
-            }
+            lock (processLock) { if (owned != null) owned.Stop(); }
         }
         public void Dispose()
         {
@@ -2381,52 +2290,5 @@ namespace AIUsageTray
         }
         [StructLayout(LayoutKind.Sequential)]
         internal struct Rect { internal int Left, Top, Right, Bottom; }
-        [StructLayout(LayoutKind.Sequential)]
-        internal struct JobBasicLimits
-        {
-            internal long PerProcessUserTimeLimit;
-            internal long PerJobUserTimeLimit;
-            internal uint LimitFlags;
-            internal UIntPtr MinimumWorkingSetSize;
-            internal UIntPtr MaximumWorkingSetSize;
-            internal uint ActiveProcessLimit;
-            internal UIntPtr Affinity;
-            internal uint PriorityClass;
-            internal uint SchedulingClass;
-        }
-        [StructLayout(LayoutKind.Sequential)]
-        internal struct JobIoCounters
-        {
-            internal ulong ReadOperationCount;
-            internal ulong WriteOperationCount;
-            internal ulong OtherOperationCount;
-            internal ulong ReadTransferCount;
-            internal ulong WriteTransferCount;
-            internal ulong OtherTransferCount;
-        }
-        [StructLayout(LayoutKind.Sequential)]
-        internal struct JobExtendedLimits
-        {
-            internal JobBasicLimits BasicLimitInformation;
-            internal JobIoCounters IoInfo;
-            internal UIntPtr ProcessMemoryLimit;
-            internal UIntPtr JobMemoryLimit;
-            internal UIntPtr PeakProcessMemoryUsed;
-            internal UIntPtr PeakJobMemoryUsed;
-        }
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        internal static extern IntPtr CreateJobObject(IntPtr attributes, string name);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        internal static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JobExtendedLimits info, uint length);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        internal static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        internal static extern bool CloseHandle(IntPtr handle);
-        internal static bool SetJobKillOnClose(IntPtr job)
-        {
-            JobExtendedLimits info = new JobExtendedLimits();
-            info.BasicLimitInformation.LimitFlags = 0x2000;
-            return SetInformationJobObject(job, 9, ref info, (uint)Marshal.SizeOf(typeof(JobExtendedLimits)));
-        }
     }
 }
