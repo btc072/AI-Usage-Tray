@@ -22,6 +22,9 @@ foreach ($file in @($compiler, $notices) + $sources) {
 if (-not $distDir.StartsWith($projectRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw 'Output directory must be inside the project'
 }
+if (Test-Path -LiteralPath $distDir) {
+    Remove-Item -LiteralPath $distDir -Recurse -Force
+}
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 
 $common = @(
