@@ -6,7 +6,7 @@ Status: complete.
 
 - `.\Check-Local.ps1 -Tests` -> `PASS: local build`, `PASS: 117 T7 checks`.
 - `Check-Local.ps1` now removes the old `dist/` before compilation.
-- Clean `dist/` contains one file: `AIUsageTray.exe`, 116,224 bytes.
+- Clean `dist/` contains one file: `AIUsageTray.exe`, 122,880 bytes.
 - The embedded resource `AIUsageTray.ThirdPartyNotices` is present and equals `THIRD-PARTY-NOTICES.txt`.
 - References remain framework-only: `System.Windows.Forms`, `System.Drawing`, `System.Web.Extensions`.
 - Static audit found no Node.js process, Worker, listener/server, proxy, or OpenCode HTTP/API call.
